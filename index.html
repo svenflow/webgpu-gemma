@@ -1,0 +1,3825 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebGPU Gemma 3 — 270M Inference at 100 t/s</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #1a1a1a; color: #fff; max-width: 1200px; margin: 0 auto; }
+    pre { background: #2a2a2a; padding: 15px; overflow: auto; white-space: pre-wrap; max-height: 400px; }
+    .success { color: #4caf50; }
+    .error { color: #f44336; }
+    .info { color: #2196f3; }
+    #status { margin: 20px 0; padding: 15px; background: #333; border-radius: 5px; font-size: 20px; }
+    #prompt-area { margin: 20px 0; display: flex; gap: 10px; align-items: center; }
+    #prompt-input {
+      flex: 1; padding: 12px; font-size: 16px; font-family: monospace;
+      background: #2a2a2a; color: #fff; border: 1px solid #555; border-radius: 5px;
+    }
+    #prompt-input:focus { outline: none; border-color: #4caf50; }
+    #generate-btn {
+      padding: 12px 24px; font-size: 16px; font-family: monospace; cursor: pointer;
+      background: #4caf50; color: #fff; border: none; border-radius: 5px;
+    }
+    #generate-btn:hover { background: #45a049; }
+    #generate-btn:disabled { background: #555; cursor: not-allowed; }
+    #output-area {
+      margin: 20px 0; padding: 20px; background: #2a2a2a; border-radius: 5px;
+      font-size: 18px; line-height: 1.6; min-height: 100px; white-space: pre-wrap;
+    }
+    #output-area .prompt-text { color: #888; }
+    #output-area .generated-text { color: #4caf50; }
+    #timing { margin: 10px 0; padding: 10px; background: #333; border-radius: 5px; color: #aaa; }
+    #controls { display: flex; gap: 10px; align-items: center; margin: 10px 0; }
+    #controls label { color: #aaa; }
+    #max-tokens { width: 60px; padding: 5px; font-family: monospace; background: #2a2a2a; color: #fff; border: 1px solid #555; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>WebGPU Gemma 3 — 270M Inference</h1>
+  <p>Q8_0 quantized, ~100 t/s on Apple Silicon. Runs entirely in your browser — no server needed.</p>
+
+  <div id="status">Loading model...</div>
+
+  <div id="prompt-area">
+    <input type="text" id="prompt-input" value="What is the capital of France?" placeholder="Enter a prompt..." disabled>
+    <button id="generate-btn" disabled onclick="onGenerate()">Generate</button>
+    <button id="debug-btn" disabled onclick="onDebugNaN()" style="padding:12px 24px;font-size:16px;font-family:monospace;cursor:pointer;background:#f44336;color:#fff;border:none;border-radius:5px;">Debug NaN</button>
+  </div>
+  <div id="controls">
+    <label>Max tokens: <input type="number" id="max-tokens" value="50" min="1" max="127"></label>
+    <label>Temperature: <input type="number" id="temperature" value="0.7" min="0" max="2" step="0.1" style="width:60px;padding:5px;font-family:monospace;background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:3px;"></label>
+    <label>Top-p: <input type="number" id="top-p" value="0.9" min="0" max="1" step="0.05" style="width:60px;padding:5px;font-family:monospace;background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:3px;"></label>
+    <label>Rep. penalty: <input type="number" id="rep-penalty" value="1.15" min="1" max="2" step="0.05" style="width:60px;padding:5px;font-family:monospace;background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:3px;"></label>
+  </div>
+
+  <div id="output-area"></div>
+  <div id="timing"></div>
+
+  <pre id="log"></pre>
+
+  <script type="module">
+    const log = (msg, cls = '') => {
+      const el = document.getElementById('log');
+      el.innerHTML += `<span class="${cls}">${msg}</span>\n`;
+      el.scrollTop = el.scrollHeight;
+      console.log(msg);
+    };
+
+    const setStatus = (msg) => {
+      document.getElementById('status').textContent = msg;
+    };
+
+    // =========================================================================
+    // Model Configuration - CORRECT Gemma 3 270M architecture
+    // =========================================================================
+    const CONFIG = {
+      hidden_size: 640,
+      q_dim: 1024,           // Q projection output (attn_q: [640, 1024])
+      kv_dim: 256,           // K, V projection output (attn_k/v: [640, 256])
+      num_q_heads: 4,        // 1024 / 256 = 4
+      num_kv_heads: 1,       // MQA (Multi-Query Attention)
+      head_dim: 256,         // from norm weight shapes [256]
+      intermediate_size: 2048,
+      vocab_size: 262144,
+      num_layers: 18,
+      context_length: 128,
+      rms_norm_eps: 1e-6,
+      rope_theta_global: 1000000.0,  // For global attention layers (5, 11, 17)
+      rope_theta_swa: 1000000.0,     // Gemma 3 uses same theta=1M for ALL layers (unlike Gemma 2 which used 10k for SWA)
+      swa_period: 6,                 // Every 6th layer is global attention
+    };
+
+    // Determine which layers use global vs SWA attention
+    // SWA pattern: il % period < (period - 1) → SWA, otherwise → global
+    function isSwaLayer(il) {
+      return (il % CONFIG.swa_period) < (CONFIG.swa_period - 1);
+    }
+
+    function getRopeTheta(il) {
+      return isSwaLayer(il) ? CONFIG.rope_theta_swa : CONFIG.rope_theta_global;
+    }
+
+    // =========================================================================
+    // GGUF Parser
+    // =========================================================================
+    class GGUFParser {
+      constructor(buffer) {
+        // Accept either ArrayBuffer or Uint8Array
+        this.buffer = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
+        this.view = new DataView(this.buffer);
+        this.offset = 0;
+        this.textDecoder = new TextDecoder('utf-8');
+      }
+
+      readUint32() {
+        const val = this.view.getUint32(this.offset, true);
+        this.offset += 4;
+        return val;
+      }
+
+      readUint64() {
+        const val = this.view.getBigUint64(this.offset, true);
+        this.offset += 8;
+        return val;
+      }
+
+      readString() {
+        const length = Number(this.readUint64());
+        const bytes = new Uint8Array(this.buffer, this.offset, length);
+        this.offset += length;
+        return this.textDecoder.decode(bytes);
+      }
+
+      readValue(type) {
+        switch (type) {
+          case 0: { const val = this.view.getUint8(this.offset); this.offset += 1; return { type: 'uint8', value: val }; }
+          case 1: { const val = this.view.getInt8(this.offset); this.offset += 1; return { type: 'int8', value: val }; }
+          case 2: { const val = this.view.getUint16(this.offset, true); this.offset += 2; return { type: 'uint16', value: val }; }
+          case 3: { const val = this.view.getInt16(this.offset, true); this.offset += 2; return { type: 'int16', value: val }; }
+          case 4: return { type: 'uint32', value: this.readUint32() };
+          case 5: { const val = this.view.getInt32(this.offset, true); this.offset += 4; return { type: 'int32', value: val }; }
+          case 6: { const val = this.view.getFloat32(this.offset, true); this.offset += 4; return { type: 'float32', value: val }; }
+          case 7: { const val = this.view.getUint8(this.offset); this.offset += 1; return { type: 'bool', value: val !== 0 }; }
+          case 8: return { type: 'string', value: this.readString() };
+          case 9: {
+            const elemType = this.readUint32();
+            const count = Number(this.readUint64());
+            const arr = [];
+            for (let i = 0; i < count; i++) arr.push(this.readValue(elemType));
+            return { type: 'array', value: arr };
+          }
+          case 10: return { type: 'uint64', value: this.readUint64() };
+          case 11: { const val = this.view.getBigInt64(this.offset, true); this.offset += 8; return { type: 'int64', value: val }; }
+          case 12: { const val = this.view.getFloat64(this.offset, true); this.offset += 8; return { type: 'float64', value: val }; }
+          default: return { type: 'unknown', value: null };
+        }
+      }
+
+      parse() {
+        const magic = this.readUint32();
+        if (magic !== 0x46554747) throw new Error(`Invalid GGUF magic: 0x${magic.toString(16)}`);
+
+        const version = this.readUint32();
+        const tensor_count = this.readUint64();
+        const kv_count = this.readUint64();
+
+        const kv = new Map();
+        for (let i = 0n; i < kv_count; i++) {
+          const key = this.readString();
+          const valueType = this.readUint32();
+          const value = this.readValue(valueType);
+          kv.set(key, value);
+        }
+
+        const tensors = [];
+        for (let i = 0n; i < tensor_count; i++) {
+          const name = this.readString();
+          const n_dims = this.readUint32();
+          const dims = [];
+          for (let d = 0; d < n_dims; d++) dims.push(this.readUint64());
+          const type = this.readUint32();
+          const offset = this.readUint64();
+          tensors.push({ name, dims, type, offset });
+        }
+
+        const alignment = 32;
+        const dataOffset = Math.ceil(this.offset / alignment) * alignment;
+
+        return { version, tensor_count, kv_count, kv, tensors, dataOffset };
+      }
+
+      f16ToF32(h) {
+        const sign = (h >> 15) & 0x1;
+        const exp = (h >> 10) & 0x1f;
+        const mant = h & 0x3ff;
+        if (exp === 0) {
+          // Subnormal f16: value = (-1)^sign * 2^(-14) * (mant/1024)
+          if (mant === 0) return sign ? -0 : 0;
+          return (sign ? -1 : 1) * Math.pow(2, -14) * (mant / 1024);
+        }
+        if (exp === 31) return mant === 0 ? (sign ? -Infinity : Infinity) : NaN;
+        return (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + mant / 1024);
+      }
+
+      dequantizeQ8_0(offset, count) {
+        const blockSize = 32;
+        const result = new Float32Array(count);
+        let resultIdx = 0;
+        let blockOffset = offset;
+
+        while (resultIdx < count) {
+          const scaleBits = this.view.getUint16(blockOffset, true);
+          const scale = this.f16ToF32(scaleBits);
+          blockOffset += 2;
+
+          const elemsInBlock = Math.min(blockSize, count - resultIdx);
+          for (let i = 0; i < elemsInBlock; i++) {
+            const q = this.view.getInt8(blockOffset + i);
+            result[resultIdx++] = q * scale;
+          }
+          blockOffset += blockSize;
+        }
+        return result;
+      }
+
+      // Pack Q8_0 data into GPU-friendly format: 9 u32 per block of 32 elements
+      // u32[0] = f32 scale (from f16), u32[1..8] = packed int8 values (4 per u32)
+      packQ8_0ForGPU(offset, totalElements) {
+        const blockSize = 32;
+        const numBlocks = totalElements / blockSize;
+        const result = new ArrayBuffer(numBlocks * 36); // 9 u32 * 4 bytes = 36 bytes per block
+        const resultU32 = new Uint32Array(result);
+        const resultF32 = new Float32Array(result);
+
+        let srcOff = offset;
+        for (let b = 0; b < numBlocks; b++) {
+          // Read f16 scale, convert to f32, store as f32 bits
+          const scaleBits = this.view.getUint16(srcOff, true);
+          const scale = this.f16ToF32(scaleBits);
+          resultF32[b * 9] = scale;
+          srcOff += 2;
+
+          // Pack 32 int8 values as 8 x u32 (4 bytes each, little-endian)
+          for (let j = 0; j < 8; j++) {
+            let packed = 0;
+            for (let k = 0; k < 4; k++) {
+              const val = this.view.getUint8(srcOff + j * 4 + k);
+              packed |= val << (k * 8);
+            }
+            resultU32[b * 9 + 1 + j] = packed;
+          }
+          srcOff += 32;
+        }
+        return new Uint32Array(result);
+      }
+
+      dequantizeF16(offset, count) {
+        const result = new Float32Array(count);
+        for (let i = 0; i < count; i++) {
+          const bits = this.view.getUint16(offset + i * 2, true);
+          result[i] = this.f16ToF32(bits);
+        }
+        return result;
+      }
+
+      getTensorData(tensor, dataOffset) {
+        const absOffset = dataOffset + Number(tensor.offset);
+        const count = Number(tensor.dims.reduce((a, b) => a * b, 1n));
+
+        if (tensor.type === 0) {
+          return new Float32Array(this.buffer, absOffset, count);
+        } else if (tensor.type === 1) {  // F16
+          return this.dequantizeF16(absOffset, count);
+        } else if (tensor.type === 8) {
+          return this.dequantizeQ8_0(absOffset, count);
+        }
+        throw new Error(`Unsupported type: ${tensor.type}`);
+      }
+
+      // Get Q8_0 tensor as packed GPU format (for quantized compute)
+      getTensorDataQ8Packed(tensor, dataOffset) {
+        const absOffset = dataOffset + Number(tensor.offset);
+        const count = Number(tensor.dims.reduce((a, b) => a * b, 1n));
+        return this.packQ8_0ForGPU(absOffset, count);
+      }
+    }
+
+    // =========================================================================
+    // Shaders
+    // =========================================================================
+    const SHADERS = {
+      // Gather a single column from transposed embedding [V, H]
+      // Gemma scales embeddings by sqrt(hidden_size) before transformer layers
+      embeddingLookup: `
+struct Params { hidden_size: u32, token_id: u32 }
+@group(0) @binding(0) var<storage, read> embedding: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= params.hidden_size) { return; }
+  output[i] = embedding[params.token_id * params.hidden_size + i] * sqrt(f32(params.hidden_size));
+}`,
+
+      rmsNorm: `
+struct Params { hidden_size: u32, eps: f32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+var<workgroup> shared_sum: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+  let tid = lid.x;
+  let hidden_size = params.hidden_size;
+
+  var partial_sum: f32 = 0.0;
+  var i = tid;
+  while (i < hidden_size) {
+    let val = input[i];
+    partial_sum += val * val;
+    i += 256u;
+  }
+  shared_sum[tid] = partial_sum;
+  workgroupBarrier();
+
+  for (var stride: u32 = 128u; stride > 0u; stride >>= 1u) {
+    if (tid < stride) { shared_sum[tid] += shared_sum[tid + stride]; }
+    workgroupBarrier();
+  }
+
+  let rms = sqrt(shared_sum[0] / f32(hidden_size) + params.eps);
+  i = tid;
+  while (i < hidden_size) {
+    output[i] = input[i] * weight[i] / rms;
+    i += 256u;
+  }
+}`,
+
+      // Per-head RMS norm: applies [head_dim] weight independently to each head
+      // data is read_write (in-place), one workgroup per head
+      perHeadRmsNorm: `
+struct Params { num_heads: u32, head_dim: u32, eps: f32, pad: u32 }
+@group(0) @binding(0) var<storage, read_write> data: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+var<workgroup> shared_sum: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+  let tid = lid.x;
+  let head = wid.x;
+  if (head >= params.num_heads) { return; }
+
+  let base = head * params.head_dim;
+
+  // Partial sum of squares
+  var partial: f32 = 0.0;
+  var i = tid;
+  while (i < params.head_dim) {
+    let val = data[base + i];
+    partial += val * val;
+    i += 256u;
+  }
+  shared_sum[tid] = partial;
+  workgroupBarrier();
+
+  for (var stride: u32 = 128u; stride > 0u; stride >>= 1u) {
+    if (tid < stride) { shared_sum[tid] += shared_sum[tid + stride]; }
+    workgroupBarrier();
+  }
+
+  let rms = sqrt(shared_sum[0] / f32(params.head_dim) + params.eps);
+
+  i = tid;
+  while (i < params.head_dim) {
+    data[base + i] = data[base + i] * weight[i] / rms;
+    i += 256u;
+  }
+}`,
+
+      // Q8_0 quantized linear: uses shared memory for input vector
+      // Loads input once per workgroup into shared memory, then each thread
+      // computes its output row from the shared input. This reduces global memory
+      // reads by the workgroup size factor (256x).
+      linearQ8: `
+struct Params { M: u32, N: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weight_q8: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+// Shared memory for input vector (max 2048 floats = 8KB)
+var<workgroup> shared_input: array<f32, 2048>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let m = gid.x;
+  let tid = lid.x;
+
+  // Cooperatively load input vector into shared memory
+  let N = params.N;
+  var i = tid;
+  while (i < N) {
+    shared_input[i] = input[i];
+    i += 256u;
+  }
+  workgroupBarrier();
+
+  if (m >= params.M) { return; }
+
+  let blocks_per_row = N / 32u;
+  let row_offset = m * blocks_per_row * 9u;
+
+  var total_sum: f32 = 0.0;
+
+  for (var b: u32 = 0u; b < blocks_per_row; b++) {
+    let block_off = row_offset + b * 9u;
+    let scale = bitcast<f32>(weight_q8[block_off]);
+    let input_base = b * 32u;
+
+    var block_sum: f32 = 0.0;
+
+    for (var chunk: u32 = 0u; chunk < 4u; chunk++) {
+      let chunk_base = input_base + chunk * 8u;
+      let qs_base = block_off + 1u + chunk * 2u;
+
+      let packed0 = weight_q8[qs_base];
+      let packed1 = weight_q8[qs_base + 1u];
+
+      block_sum += f32(extractBits(bitcast<i32>(packed0), 0u, 8u))  * shared_input[chunk_base + 0u];
+      block_sum += f32(extractBits(bitcast<i32>(packed0), 8u, 8u))  * shared_input[chunk_base + 1u];
+      block_sum += f32(extractBits(bitcast<i32>(packed0), 16u, 8u)) * shared_input[chunk_base + 2u];
+      block_sum += f32(extractBits(bitcast<i32>(packed0), 24u, 8u)) * shared_input[chunk_base + 3u];
+      block_sum += f32(extractBits(bitcast<i32>(packed1), 0u, 8u))  * shared_input[chunk_base + 4u];
+      block_sum += f32(extractBits(bitcast<i32>(packed1), 8u, 8u))  * shared_input[chunk_base + 5u];
+      block_sum += f32(extractBits(bitcast<i32>(packed1), 16u, 8u)) * shared_input[chunk_base + 6u];
+      block_sum += f32(extractBits(bitcast<i32>(packed1), 24u, 8u)) * shared_input[chunk_base + 7u];
+    }
+
+    total_sum += block_sum * scale;
+  }
+
+  output[m] = total_sum;
+}`,
+
+      // F32 linear: matrix-vector multiply with shared memory for input vector
+      // Used when Q8_0 weights are dequantized to f32 at load time
+      linearF32: `
+struct Params { M: u32, N: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+var<workgroup> shared_input: array<f32, 2048>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let m = gid.x;
+  let tid = lid.x;
+  let N = params.N;
+
+  var i = tid;
+  while (i < N) {
+    shared_input[i] = input[i];
+    i += 256u;
+  }
+  workgroupBarrier();
+
+  if (m >= params.M) { return; }
+
+  let row_offset = m * N;
+  var sum0: f32 = 0.0;
+  var sum1: f32 = 0.0;
+  var sum2: f32 = 0.0;
+  var sum3: f32 = 0.0;
+
+  var j: u32 = 0u;
+  let end4 = (N / 4u) * 4u;
+  while (j < end4) {
+    sum0 += weight[row_offset + j] * shared_input[j];
+    sum1 += weight[row_offset + j + 1u] * shared_input[j + 1u];
+    sum2 += weight[row_offset + j + 2u] * shared_input[j + 2u];
+    sum3 += weight[row_offset + j + 3u] * shared_input[j + 3u];
+    j += 4u;
+  }
+  while (j < N) {
+    sum0 += weight[row_offset + j] * shared_input[j];
+    j += 1u;
+  }
+  output[m] = sum0 + sum1 + sum2 + sum3;
+}`,
+
+      // Fused GeGLU activation: GELU(gate) * up
+      // Gemma 3 uses GeGLU, NOT SiGLU/SwiGLU
+      // GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * x * (1 + 0.044715 * x²)))
+      siluMul: `
+const SQRT_2_OVER_PI: f32 = 0.7978845608028654;
+const GELU_COEF_A: f32 = 0.044715;
+
+@group(0) @binding(0) var<storage, read> gate: array<f32>;
+@group(0) @binding(1) var<storage, read> up: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> size: u32;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= size) { return; }
+  let x = gate[i];
+  // Clamp tanh argument to prevent NaN on some GPU tanh implementations
+  // (Metal/WebGPU can return NaN for |arg| > ~44 instead of saturating to ±1)
+  let tanh_arg = clamp(SQRT_2_OVER_PI * x * (1.0 + GELU_COEF_A * x * x), -15.0, 15.0);
+  let gelu = 0.5 * x * (1.0 + tanh(tanh_arg));
+  output[i] = gelu * up[i];
+}`,
+
+      // Fused RMS norm + Q8 linear: compute norm, write normed to global AND shared,
+      // then compute Q8 linear from shared memory. Also outputs normed for K/V.
+      // Saves 1 dispatch boundary per use.
+      fusedNormLinearQ8: `
+struct Params { M: u32, N: u32, eps: f32, pad: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> norm_weight: array<f32>;
+@group(0) @binding(2) var<storage, read> weight_q8: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> normed_out: array<f32>;
+@group(0) @binding(5) var<uniform> params: Params;
+
+var<workgroup> shared_normed: array<f32, 2048>;
+var<workgroup> shared_rms: f32;
+var<workgroup> shared_sum: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let m = gid.x;
+  let tid = lid.x;
+  let N = params.N;
+
+  // Step 1: Cooperatively compute RMS of input
+  var partial: f32 = 0.0;
+  var i = tid;
+  while (i < N) {
+    let val = input[i];
+    partial += val * val;
+    i += 256u;
+  }
+  shared_sum[tid] = partial;
+  workgroupBarrier();
+
+  for (var stride: u32 = 128u; stride > 0u; stride >>= 1u) {
+    if (tid < stride) { shared_sum[tid] += shared_sum[tid + stride]; }
+    workgroupBarrier();
+  }
+
+  if (tid == 0u) {
+    shared_rms = sqrt(shared_sum[0] / f32(N) + params.eps);
+  }
+  workgroupBarrier();
+
+  let rms = shared_rms;
+
+  // Step 2: Normalize into shared memory AND global normed_out (for K/V to use)
+  i = tid;
+  while (i < N) {
+    let val = input[i] * norm_weight[i] / rms;
+    shared_normed[i] = val;
+    normed_out[i] = val;
+    i += 256u;
+  }
+  workgroupBarrier();
+
+  // Step 3: Q8 linear from shared normed input
+  if (m >= params.M) { return; }
+
+  let blocks_per_row = N / 32u;
+  let row_offset = m * blocks_per_row * 9u;
+  var total_sum: f32 = 0.0;
+
+  for (var b: u32 = 0u; b < blocks_per_row; b++) {
+    let block_off = row_offset + b * 9u;
+    let scale = bitcast<f32>(weight_q8[block_off]);
+    let input_base = b * 32u;
+    var block_sum: f32 = 0.0;
+
+    for (var chunk: u32 = 0u; chunk < 4u; chunk++) {
+      let chunk_base = input_base + chunk * 8u;
+      let qs_base = block_off + 1u + chunk * 2u;
+      let packed0 = weight_q8[qs_base];
+      let packed1 = weight_q8[qs_base + 1u];
+
+      block_sum += f32(extractBits(bitcast<i32>(packed0), 0u, 8u))  * shared_normed[chunk_base + 0u];
+      block_sum += f32(extractBits(bitcast<i32>(packed0), 8u, 8u))  * shared_normed[chunk_base + 1u];
+      block_sum += f32(extractBits(bitcast<i32>(packed0), 16u, 8u)) * shared_normed[chunk_base + 2u];
+      block_sum += f32(extractBits(bitcast<i32>(packed0), 24u, 8u)) * shared_normed[chunk_base + 3u];
+      block_sum += f32(extractBits(bitcast<i32>(packed1), 0u, 8u))  * shared_normed[chunk_base + 4u];
+      block_sum += f32(extractBits(bitcast<i32>(packed1), 8u, 8u))  * shared_normed[chunk_base + 5u];
+      block_sum += f32(extractBits(bitcast<i32>(packed1), 16u, 8u)) * shared_normed[chunk_base + 6u];
+      block_sum += f32(extractBits(bitcast<i32>(packed1), 24u, 8u)) * shared_normed[chunk_base + 7u];
+    }
+    total_sum += block_sum * scale;
+  }
+
+  output[m] = total_sum;
+}`,
+
+      add: `
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> size: u32;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= size) { return; }
+  output[i] = a[i] + b[i];
+}`,
+
+      // RoPE: Apply rotary position embedding to Q or K
+      // Uses NEOX/half-split pairing: pairs are (data[i], data[i + half_dim])
+      // This matches llama.cpp's LLAMA_ROPE_TYPE_NEOX used by Gemma 3
+      rope: `
+struct Params { num_heads: u32, head_dim: u32, position: u32, theta: f32 }
+@group(0) @binding(0) var<storage, read_write> data: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  let half_dim = params.head_dim / 2u;
+  let total_pairs = params.num_heads * half_dim;
+  if (idx >= total_pairs) { return; }
+
+  let head = idx / half_dim;
+  let i = idx % half_dim;
+
+  let base = head * params.head_dim;
+  let freq = 1.0 / pow(params.theta, f32(i * 2u) / f32(params.head_dim));
+  let angle = f32(params.position) * freq;
+  let cos_a = cos(angle);
+  let sin_a = sin(angle);
+
+  let x0 = data[base + i];
+  let x1 = data[base + i + half_dim];
+  data[base + i] = x0 * cos_a - x1 * sin_a;
+  data[base + i + half_dim] = x0 * sin_a + x1 * cos_a;
+}`,
+
+      // Copy K/V into KV cache at the current position
+      kvCacheStore: `
+struct Params { num_kv_heads: u32, head_dim: u32, position: u32, max_seq_len: u32 }
+@group(0) @binding(0) var<storage, read> k_in: array<f32>;
+@group(0) @binding(1) var<storage, read> v_in: array<f32>;
+@group(0) @binding(2) var<storage, read_write> k_cache: array<f32>;
+@group(0) @binding(3) var<storage, read_write> v_cache: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  let total = params.num_kv_heads * params.head_dim;
+  if (i >= total) { return; }
+
+  let head = i / params.head_dim;
+  let d = i % params.head_dim;
+
+  // Cache layout: [max_seq, num_kv_heads, head_dim]
+  let cache_idx = params.position * total + head * params.head_dim + d;
+  k_cache[cache_idx] = k_in[i];
+  v_cache[cache_idx] = v_in[i];
+}`,
+
+      // Attention score with GQA
+      attnScore: `
+struct Params { num_q_heads: u32, num_kv_heads: u32, head_dim: u32, seq_len: u32, scale: f32, pad0: u32 }
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> k_cache: array<f32>;
+@group(0) @binding(2) var<storage, read_write> scores: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  let total = params.num_q_heads * params.seq_len;
+  if (idx >= total) { return; }
+
+  let head = idx / params.seq_len;
+  let pos = idx % params.seq_len;
+
+  // GQA: map Q head to KV head
+  let kv_head = head * params.num_kv_heads / params.num_q_heads;
+
+  let q_offset = head * params.head_dim;
+  // K cache layout: [max_seq, num_kv_heads, head_dim]
+  let kv_stride = params.num_kv_heads * params.head_dim;
+  let k_offset = pos * kv_stride + kv_head * params.head_dim;
+
+  var dot: f32 = 0.0;
+  for (var d: u32 = 0u; d < params.head_dim; d++) {
+    dot += q[q_offset + d] * k_cache[k_offset + d];
+  }
+
+  scores[head * params.seq_len + pos] = dot * params.scale;
+}`,
+
+      // Softmax over scores[num_heads, seq_len] - one workgroup per head
+      softmax: `
+struct Params { num_heads: u32, seq_len: u32 }
+@group(0) @binding(0) var<storage, read_write> scores: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+var<workgroup> shared_max: array<f32, 256>;
+var<workgroup> shared_sum: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+  let tid = lid.x;
+  let head = wid.x;
+  if (head >= params.num_heads) { return; }
+
+  let base = head * params.seq_len;
+
+  // Find max
+  var local_max: f32 = -1e30;
+  var i = tid;
+  while (i < params.seq_len) {
+    local_max = max(local_max, scores[base + i]);
+    i += 256u;
+  }
+  shared_max[tid] = local_max;
+  workgroupBarrier();
+
+  for (var stride: u32 = 128u; stride > 0u; stride >>= 1u) {
+    if (tid < stride) { shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]); }
+    workgroupBarrier();
+  }
+  let max_val = shared_max[0];
+
+  // Exp and sum
+  var local_sum: f32 = 0.0;
+  i = tid;
+  while (i < params.seq_len) {
+    let e = exp(scores[base + i] - max_val);
+    scores[base + i] = e;
+    local_sum += e;
+    i += 256u;
+  }
+  shared_sum[tid] = local_sum;
+  workgroupBarrier();
+
+  for (var stride: u32 = 128u; stride > 0u; stride >>= 1u) {
+    if (tid < stride) { shared_sum[tid] += shared_sum[tid + stride]; }
+    workgroupBarrier();
+  }
+  let sum_val = shared_sum[0];
+
+  // Normalize
+  i = tid;
+  while (i < params.seq_len) {
+    scores[base + i] = scores[base + i] / sum_val;
+    i += 256u;
+  }
+}`,
+
+      // Attention output: probs[num_q_heads, seq_len] @ V_cache[seq_len, num_kv_heads, head_dim]
+      attnOutput: `
+struct Params { num_q_heads: u32, num_kv_heads: u32, head_dim: u32, seq_len: u32 }
+@group(0) @binding(0) var<storage, read> probs: array<f32>;
+@group(0) @binding(1) var<storage, read> v_cache: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  let total = params.num_q_heads * params.head_dim;
+  if (idx >= total) { return; }
+
+  let head = idx / params.head_dim;
+  let d = idx % params.head_dim;
+
+  let kv_head = head * params.num_kv_heads / params.num_q_heads;
+
+  let kv_stride = params.num_kv_heads * params.head_dim;
+
+  var sum: f32 = 0.0;
+  for (var pos: u32 = 0u; pos < params.seq_len; pos++) {
+    let prob = probs[head * params.seq_len + pos];
+    let v_idx = pos * kv_stride + kv_head * params.head_dim + d;
+    sum += prob * v_cache[v_idx];
+  }
+
+  output[head * params.head_dim + d] = sum;
+}`,
+
+      // LM Head: project hidden state [H] to logits [V] via embedding matrix [V, H]
+      // Optimized with vec4 loads for 4x better memory coalescing
+      lmHead: `
+struct Params { vocab_size: u32, hidden_size: u32 }
+@group(0) @binding(0) var<storage, read> hidden: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> embedding: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> logits: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let v = gid.x;
+  if (v >= params.vocab_size) { return; }
+
+  let vec4_count = params.hidden_size / 4u;
+  let emb_offset = v * vec4_count;
+
+  var sum0: vec4<f32> = vec4<f32>(0.0);
+  var sum1: vec4<f32> = vec4<f32>(0.0);
+  var sum2: vec4<f32> = vec4<f32>(0.0);
+  var sum3: vec4<f32> = vec4<f32>(0.0);
+
+  let end4 = (vec4_count / 4u) * 4u;
+  var i: u32 = 0u;
+  while (i < end4) {
+    sum0 += hidden[i] * embedding[emb_offset + i];
+    sum1 += hidden[i+1u] * embedding[emb_offset + i + 1u];
+    sum2 += hidden[i+2u] * embedding[emb_offset + i + 2u];
+    sum3 += hidden[i+3u] * embedding[emb_offset + i + 3u];
+    i += 4u;
+  }
+  while (i < vec4_count) {
+    sum0 += hidden[i] * embedding[emb_offset + i];
+    i += 1u;
+  }
+
+  let total = sum0 + sum1 + sum2 + sum3;
+  logits[v] = total.x + total.y + total.z + total.w;
+}`,
+
+      // Argmax: find index of maximum value in logits array
+      argmax: `
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> result: array<u32>;
+@group(0) @binding(2) var<uniform> size: u32;
+var<workgroup> shared_max: array<f32, 256>;
+var<workgroup> shared_idx: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+  let tid = lid.x;
+
+  var local_max: f32 = -1e30;
+  var local_idx: u32 = 0u;
+
+  var i = tid;
+  while (i < size) {
+    let val = logits[i];
+    if (val > local_max) {
+      local_max = val;
+      local_idx = i;
+    }
+    i += 256u;
+  }
+
+  shared_max[tid] = local_max;
+  shared_idx[tid] = local_idx;
+  workgroupBarrier();
+
+  for (var stride: u32 = 128u; stride > 0u; stride >>= 1u) {
+    if (tid < stride && shared_max[tid + stride] > shared_max[tid]) {
+      shared_max[tid] = shared_max[tid + stride];
+      shared_idx[tid] = shared_idx[tid + stride];
+    }
+    workgroupBarrier();
+  }
+
+  if (tid == 0u) {
+    result[0] = shared_idx[0];
+  }
+}`,
+
+      // Top-K: each of 256 threads finds its local best, output all 256 candidates
+      // Result: interleaved [val0, id0, val1, id1, ...] as f32 (256 pairs = 512 f32s)
+      topk256: `
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> result: array<f32>;
+@group(0) @binding(2) var<uniform> size: u32;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+  let tid = lid.x;
+
+  var local_max: f32 = -1e30;
+  var local_idx: u32 = 0u;
+
+  var i = tid;
+  while (i < size) {
+    let val = logits[i];
+    if (val > local_max) {
+      local_max = val;
+      local_idx = i;
+    }
+    i += 256u;
+  }
+
+  // Write value and index (as bitcast f32) interleaved
+  result[tid * 2u] = local_max;
+  result[tid * 2u + 1u] = bitcast<f32>(local_idx);
+}`,
+
+      // Fused RMS norm + residual add: out[i] = residual[i] + (input[i] * weight[i] / rms)
+      // Replaces separate rmsNorm + add passes, saving 1 dispatch boundary
+      fusedNormAdd: `
+struct Params { size: u32, eps: f32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read> residual: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+
+var<workgroup> shared_sum: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+  let tid = lid.x;
+  let N = params.size;
+
+  var partial: f32 = 0.0;
+  var i = tid;
+  while (i < N) {
+    let val = input[i];
+    partial += val * val;
+    i += 256u;
+  }
+  shared_sum[tid] = partial;
+  workgroupBarrier();
+
+  for (var stride: u32 = 128u; stride > 0u; stride >>= 1u) {
+    if (tid < stride) { shared_sum[tid] += shared_sum[tid + stride]; }
+    workgroupBarrier();
+  }
+
+  let rms = sqrt(shared_sum[0] / f32(N) + params.eps);
+
+  i = tid;
+  while (i < N) {
+    output[i] = residual[i] + input[i] * weight[i] / rms;
+    i += 256u;
+  }
+}`,
+
+      // Fused per-head RMS norm + RoPE: normalize each head then apply rotary embedding
+      // Replaces separate perHeadRmsNorm + rope passes, saving 1 dispatch boundary per layer
+      fusedPerHeadNormRope: `
+struct Params { num_heads: u32, head_dim: u32, eps: f32, position: u32, theta: f32, pad: u32 }
+@group(0) @binding(0) var<storage, read_write> data: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+var<workgroup> shared_sum: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+  let head = wid.x;
+  if (head >= params.num_heads) { return; }
+  let tid = lid.x;
+  let base = head * params.head_dim;
+
+  // Step 1: Compute RMS of this head
+  var partial: f32 = 0.0;
+  var i = tid;
+  while (i < params.head_dim) {
+    let val = data[base + i];
+    partial += val * val;
+    i += 256u;
+  }
+  shared_sum[tid] = partial;
+  workgroupBarrier();
+
+  for (var stride: u32 = 128u; stride > 0u; stride >>= 1u) {
+    if (tid < stride) { shared_sum[tid] += shared_sum[tid + stride]; }
+    workgroupBarrier();
+  }
+
+  let rms = sqrt(shared_sum[0] / f32(params.head_dim) + params.eps);
+
+  // Step 2: Normalize with weight
+  i = tid;
+  while (i < params.head_dim) {
+    data[base + i] = data[base + i] * weight[i] / rms;
+    i += 256u;
+  }
+  workgroupBarrier();
+
+  // Step 3: Apply RoPE rotation using NEOX/half-split pairing
+  // Pairs: (data[i], data[i + half_dim]) — matches llama.cpp LLAMA_ROPE_TYPE_NEOX
+  let half_dim = params.head_dim / 2u;
+  i = tid;
+  while (i < half_dim) {
+    let freq = 1.0 / pow(params.theta, f32(i * 2u) / f32(params.head_dim));
+    let angle = f32(params.position) * freq;
+    let cos_a = cos(angle);
+    let sin_a = sin(angle);
+
+    let x0 = data[base + i];
+    let x1 = data[base + i + half_dim];
+    data[base + i] = x0 * cos_a - x1 * sin_a;
+    data[base + i + half_dim] = x0 * sin_a + x1 * cos_a;
+    i += 256u;
+  }
+}`,
+    };
+
+    // =========================================================================
+    // Global state
+    // =========================================================================
+    let device = null; window._d = () => device;
+    let pipelines = {};
+    let modelBuffers = null; window._mb = () => modelBuffers;
+    let workBuffers = null; window._wb = () => workBuffers;
+    let uniformBuffers = null;
+    let kvCaches = null;
+    let gguf = null;
+    let parser = null;
+
+    // Tokenizer
+    let vocab = [];
+    let vocabByLength = [];
+
+    // Memory tracking
+    let weightMemoryQ8 = 0;
+    let weightMemoryF32Equiv = 0;
+
+    async function initWebGPU() {
+      if (device) return device;
+      if (!navigator.gpu) throw new Error('WebGPU not supported');
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+      device = await adapter.requestDevice({
+        requiredLimits: {
+          maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+          maxBufferSize: adapter.limits.maxBufferSize,
+        },
+      });
+      log(`WebGPU device initialized`);
+      log(`Max storage buffer: ${(device.limits.maxStorageBufferBindingSize / 1e9).toFixed(2)} GB`);
+      return device;
+    }
+
+    function createPipelines() {
+      pipelines = {};
+      for (const [name, code] of Object.entries(SHADERS)) {
+        const module = device.createShaderModule({ code });
+        pipelines[name] = device.createComputePipeline({
+          layout: 'auto',
+          compute: { module, entryPoint: 'main' },
+        });
+      }
+      log(`Created ${Object.keys(pipelines).length} compute pipelines`);
+    }
+
+    // =========================================================================
+    // Pre-create ALL uniform buffers at load time
+    // =========================================================================
+    function createUniformBuffers() {
+      const H = CONFIG.hidden_size;       // 640
+      const Q = CONFIG.q_dim;             // 1024
+      const KV = CONFIG.kv_dim;           // 256
+      const I = CONFIG.intermediate_size; // 2048
+      const MAX_SEQ = CONFIG.context_length;
+      const V = CONFIG.vocab_size;
+      const HD = CONFIG.head_dim;         // 256
+      const NQH = CONFIG.num_q_heads;     // 4
+      const NKH = CONFIG.num_kv_heads;    // 1
+
+      log(`  Architecture: hidden=${H}, q_dim=${Q}, kv_dim=${KV}, num_q_heads=${NQH}, num_kv_heads=${NKH}, head_dim=${HD}`);
+
+      // Helper to create uniform from mixed uint32/float32 values
+      const makeUniformMixed = (values) => {
+        const size = Math.max(values.length * 4, 16);
+        const ab = new ArrayBuffer(size);
+        const u32 = new Uint32Array(ab);
+        const f32 = new Float32Array(ab);
+        for (let i = 0; i < values.length; i++) {
+          if ('u' in values[i]) u32[i] = values[i].u;
+          else f32[i] = values[i].f;
+        }
+        const buf = device.createBuffer({
+          size,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          mappedAtCreation: true,
+        });
+        new Uint8Array(buf.getMappedRange()).set(new Uint8Array(ab));
+        buf.unmap();
+        return buf;
+      };
+
+      uniformBuffers = {
+        // RMS norm params: {hidden_size: H, eps: 1e-6}
+        rmsNorm: makeUniformMixed([{u: H}, {f: CONFIG.rms_norm_eps}]),
+
+        // Per-head RMS norm for Q: {num_heads: 4, head_dim: 256, eps, pad}
+        perHeadRmsNormQ: makeUniformMixed([{u: NQH}, {u: HD}, {f: CONFIG.rms_norm_eps}, {u: 0}]),
+        // Per-head RMS norm for K: {num_heads: 1, head_dim: 256, eps, pad}
+        perHeadRmsNormK: makeUniformMixed([{u: NKH}, {u: HD}, {f: CONFIG.rms_norm_eps}, {u: 0}]),
+
+        // Q8 linear params: {M, N} - M is output dim, N is input dim
+        linearQ8_Q_H: makeUniformMixed([{u: Q}, {u: H}]),       // attn_q: [640] -> [1024]
+        linearQ8_KV_H: makeUniformMixed([{u: KV}, {u: H}]),     // attn_k, attn_v: [640] -> [256]
+        linearQ8_H_Q: makeUniformMixed([{u: H}, {u: Q}]),       // attn_output: [1024] -> [640]
+        linearQ8_I_H: makeUniformMixed([{u: I}, {u: H}]),       // ffn_gate, ffn_up: [640] -> [2048]
+        linearQ8_H_I: makeUniformMixed([{u: H}, {u: I}]),       // ffn_down: [2048] -> [640]
+
+        // Element-wise size params
+        sizeH: makeUniformMixed([{u: H}]),
+        sizeI: makeUniformMixed([{u: I}]),
+
+        // Embedding lookup: {hidden_size, token_id} - token_id written per inference
+        embeddingLookup: makeUniformMixed([{u: H}, {u: 0}]),
+
+        // Per-layer RoPE Q/K params: {num_heads, head_dim, position, theta}
+        // SWA layers use theta=10000, global layers use theta=1000000
+        ropeQ: [],  // will be filled per-layer
+        ropeK: [],  // will be filled per-layer
+
+        // KV cache store: {num_kv_heads: 1, head_dim: 256, position, max_seq_len}
+        kvCacheStore: makeUniformMixed([{u: NKH}, {u: HD}, {u: 0}, {u: MAX_SEQ}]),
+
+        // Attention score: {num_q_heads: 4, num_kv_heads: 1, head_dim: 256, seq_len, scale: 1/sqrt(256), pad}
+        attnScore: makeUniformMixed([
+          {u: NQH}, {u: NKH}, {u: HD},
+          {u: 0}, {f: 1.0 / Math.sqrt(HD)}, {u: 0}
+        ]),
+
+        // Softmax: {num_heads: 4, seq_len}
+        softmax: makeUniformMixed([{u: NQH}, {u: 0}]),
+
+        // Attention output: {num_q_heads: 4, num_kv_heads: 1, head_dim: 256, seq_len}
+        attnOutput: makeUniformMixed([{u: NQH}, {u: NKH}, {u: HD}, {u: 0}]),
+
+        // LM Head (Q8_0): {M=vocab_size, N=hidden_size}
+        lmHead: makeUniformMixed([{u: V}, {u: H}]),
+        linearQ8_V_H: makeUniformMixed([{u: V}, {u: H}]),   // lm_head Q8_0: [640] -> [262144]
+
+        // Argmax: vocab_size
+        argmaxSize: makeUniformMixed([{u: V}]),
+      };
+
+      // Create per-layer RoPE uniform buffers with layer-specific theta
+      // Also create fusedPerHeadNormRope uniforms: {num_heads, head_dim, eps, position, theta, pad}
+      uniformBuffers.fusedNormRopeQ = [];
+      uniformBuffers.fusedNormRopeK = [];
+      for (let il = 0; il < CONFIG.num_layers; il++) {
+        const theta = getRopeTheta(il);
+        uniformBuffers.ropeQ.push(makeUniformMixed([{u: NQH}, {u: HD}, {u: 0}, {f: theta}]));
+        uniformBuffers.ropeK.push(makeUniformMixed([{u: NKH}, {u: HD}, {u: 0}, {f: theta}]));
+        // Fused norm+rope: {num_heads, head_dim, eps, position, theta, pad}
+        uniformBuffers.fusedNormRopeQ.push(makeUniformMixed([{u: NQH}, {u: HD}, {f: CONFIG.rms_norm_eps}, {u: 0}, {f: theta}, {u: 0}]));
+        uniformBuffers.fusedNormRopeK.push(makeUniformMixed([{u: NKH}, {u: HD}, {f: CONFIG.rms_norm_eps}, {u: 0}, {f: theta}, {u: 0}]));
+      }
+      log(`  RoPE theta per layer: ${Array.from({length: CONFIG.num_layers}, (_, i) => `${i}:${isSwaLayer(i) ? '10k' : '1M'}`).join(', ')}`);
+
+      log(`  Created ${Object.keys(uniformBuffers).length} pre-allocated uniform buffers`);
+      log(`  Attention scale: ${(1.0 / Math.sqrt(HD)).toFixed(6)} (1/sqrt(${HD}))`);
+    }
+
+    // =========================================================================
+    // Extract tokenizer from GGUF metadata
+    // =========================================================================
+    function extractTokenizer() {
+      const tokensKV = gguf.kv.get('tokenizer.ggml.tokens');
+      if (tokensKV && tokensKV.type === 'array') {
+        vocab = tokensKV.value.map(v => v.value);
+        log(`  Extracted vocabulary: ${vocab.length} tokens`);
+      } else {
+        log('  WARNING: No tokenizer found in GGUF metadata', 'error');
+        return;
+      }
+
+      // Build sorted entries for greedy encoding (longest first)
+      vocabByLength = [];
+      for (let i = 0; i < vocab.length; i++) {
+        if (vocab[i] && vocab[i].length > 0) {
+          vocabByLength.push([i, vocab[i]]);
+        }
+      }
+      // Build prefix map for fast lookup
+      buildTokenIndex();
+
+      const modelKV = gguf.kv.get('tokenizer.ggml.model');
+      if (modelKV) {
+        log(`  Tokenizer model: ${modelKV.value}`);
+      }
+    }
+
+    // Build a prefix-based index for faster tokenization
+    let tokenByText = new Map();
+    let maxTokenLen = 0;
+
+    function buildTokenIndex() {
+      tokenByText = new Map();
+      maxTokenLen = 0;
+      for (let i = 0; i < vocab.length; i++) {
+        const token = vocab[i];
+        if (token && token.length > 0) {
+          if (!tokenByText.has(token)) {
+            tokenByText.set(token, i);
+          }
+          if (token.length > maxTokenLen) {
+            maxTokenLen = token.length;
+          }
+        }
+      }
+      log(`  Token index: ${tokenByText.size} unique entries, max length ${maxTokenLen}`);
+    }
+
+    // Special tokens that must be matched whole before SentencePiece encoding
+    const SPECIAL_TOKENS = {
+      '<start_of_turn>': 105,
+      '<end_of_turn>': 106,
+      '<eos>': 1,
+      '<bos>': 2,
+    };
+
+    function encodeSegment(text, addPrefix = true) {
+      // Encode a text segment using SentencePiece greedy longest-match
+      // addPrefix: whether to prepend ▁ (only for standalone text, not after special tokens)
+      const tokens = [];
+      let remaining = text.replace(/ /g, '\u2581');
+      if (addPrefix) {
+        remaining = '\u2581' + remaining;
+      }
+
+      while (remaining.length > 0) {
+        let bestLen = 0;
+        let bestId = -1;
+
+        const tryLen = Math.min(remaining.length, maxTokenLen);
+        for (let len = tryLen; len >= 1; len--) {
+          const candidate = remaining.substring(0, len);
+          const id = tokenByText.get(candidate);
+          if (id !== undefined) {
+            bestLen = len;
+            bestId = id;
+            break;
+          }
+        }
+
+        if (bestLen === 0) {
+          remaining = remaining.slice(1);
+        } else {
+          tokens.push(bestId);
+          remaining = remaining.slice(bestLen);
+        }
+      }
+      return tokens;
+    }
+
+    function encodeSimple(text) {
+      const tokens = [2]; // BOS token
+
+      // Split text on special tokens, preserving them
+      const specialPattern = /<start_of_turn>|<end_of_turn>|<eos>|<bos>/g;
+      let lastIdx = 0;
+      let match;
+      let afterSpecial = false;
+
+      while ((match = specialPattern.exec(text)) !== null) {
+        // Encode text before the special token
+        const before = text.slice(lastIdx, match.index);
+        if (before.length > 0) {
+          // After special tokens, don't prepend ▁
+          tokens.push(...encodeSegment(before, !afterSpecial));
+        }
+        // Add the special token ID directly
+        tokens.push(SPECIAL_TOKENS[match[0]]);
+        lastIdx = match.index + match[0].length;
+        afterSpecial = true;
+      }
+
+      // Encode remaining text after last special token
+      const remaining = text.slice(lastIdx);
+      if (remaining.length > 0) {
+        tokens.push(...encodeSegment(remaining, !afterSpecial));
+      }
+
+      return tokens;
+    }
+
+    function decodeToken(tokenId) {
+      if (tokenId < vocab.length && vocab[tokenId]) {
+        return vocab[tokenId].replace(/\u2581/g, ' ');
+      }
+      return `<unk:${tokenId}>`;
+    }
+
+    function decodeTokens(tokenIds) {
+      let text = '';
+      for (const id of tokenIds) {
+        text += decodeToken(id);
+      }
+      return text;
+    }
+
+    // =========================================================================
+    // Upload weights - Q8_0 tensors stay packed, F32 tensors stay f32
+    // =========================================================================
+    function uploadWeightsToGPU() {
+      const tensors = gguf.tensors;
+      const dataOffset = gguf.dataOffset;
+
+      modelBuffers = {
+        embedding: null,
+        layers: [],
+        finalNorm: null,
+      };
+
+      // Embedding is already [V, H] in GGUF (262144 rows of 640 elements)
+      // GGUF ne=[640, 262144] means ne[0]=inner=640, ne[1]=outer=262144
+      // No transpose needed!
+      const embedTensor = tensors.find(t => t.name === 'token_embd.weight');
+      if (embedTensor) {
+        const rawData = parser.getTensorData(embedTensor, dataOffset);
+        const H = CONFIG.hidden_size;
+        const V = CONFIG.vocab_size;
+
+        log(`  Embedding [${V}, ${H}] - already in correct layout, no transpose needed`);
+
+        // F32 embedding for token lookup
+        modelBuffers.embedding = device.createBuffer({
+          size: rawData.byteLength,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        device.queue.writeBuffer(modelBuffers.embedding, 0, rawData);
+        log(`  Loaded embedding (f32 for lookup): ${(rawData.byteLength / 1e6).toFixed(1)}MB`);
+
+        // Q8_0 packed embedding for LM head (only for Q8_0 models)
+        if (embedTensor.type === 8) {  // Q8_0
+          const packedEmbedding = parser.getTensorDataQ8Packed(embedTensor, dataOffset);
+          modelBuffers.embeddingQ8 = device.createBuffer({
+            size: packedEmbedding.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+          });
+          device.queue.writeBuffer(modelBuffers.embeddingQ8, 0, packedEmbedding);
+          log(`  Loaded embedding (Q8_0 packed for LM head): ${(packedEmbedding.byteLength / 1e6).toFixed(1)}MB`);
+        } else {
+          log(`  Skipping Q8_0 packed embedding (using f32 for LM head — tensor type=${embedTensor.type})`);
+        }
+      }
+
+      // Final norm weight (F32)
+      const finalNormTensor = tensors.find(t => t.name === 'output_norm.weight');
+      if (finalNormTensor) {
+        const data = parser.getTensorData(finalNormTensor, dataOffset);
+        modelBuffers.finalNorm = device.createBuffer({
+          size: data.byteLength,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        device.queue.writeBuffer(modelBuffers.finalNorm, 0, data);
+      }
+
+      // Q8_0 weight names (these get packed format for quantized compute)
+      const q8WeightNames = ['attn_q', 'attn_k', 'attn_v', 'attn_output', 'ffn_gate', 'ffn_up', 'ffn_down'];
+      // F32 weight names (norm weights stay as f32)
+      const f32WeightNames = ['attn_norm', 'ffn_norm', 'attn_q_norm', 'attn_k_norm', 'post_attention_norm', 'post_ffw_norm'];
+
+      for (let i = 0; i < CONFIG.num_layers; i++) {
+        const prefix = `blk.${i}.`;
+        const layer = {};
+
+        // Load F32 norm weights
+        for (const key of f32WeightNames) {
+          const suffix = key + '.weight';
+          const tensor = tensors.find(t => t.name === prefix + suffix);
+          if (tensor) {
+            const data = parser.getTensorData(tensor, dataOffset);
+            layer[key] = device.createBuffer({
+              size: data.byteLength,
+              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(layer[key], 0, data);
+            if (i === 0) {
+              log(`    ${key}: [${tensor.dims.join(', ')}] F32 (${data.byteLength} bytes)`);
+            }
+          } else if (i === 0) {
+            log(`    WARNING: Missing ${prefix}${suffix}`, 'error');
+          }
+        }
+
+        // Load linear weights as Q8_0 packed (on-GPU dequantization)
+        for (const key of q8WeightNames) {
+          const suffix = key + '.weight';
+          const tensor = tensors.find(t => t.name === prefix + suffix);
+          if (tensor) {
+            const data = parser.getTensorDataQ8Packed(tensor, dataOffset); // Q8_0 packed for GPU
+            layer[key] = device.createBuffer({
+              size: data.byteLength,
+              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(layer[key], 0, data);
+
+            if (i === 0) {
+              weightMemoryQ8 += data.byteLength;
+              const numElements = Number(tensor.dims.reduce((a, b) => a * b, 1n));
+              weightMemoryF32Equiv += numElements * 4;
+              const typeStr = tensor.type === 1 ? 'F16→Q8' : tensor.type === 8 ? 'Q8_0' : 'f32';
+              log(`    ${key}: [${tensor.dims.join(', ')}] ${typeStr} packed (${data.byteLength} bytes)`);
+            }
+          }
+        }
+
+        modelBuffers.layers.push(layer);
+      }
+
+      const totalQ8 = weightMemoryQ8 * CONFIG.num_layers;
+      const totalF32 = weightMemoryF32Equiv * CONFIG.num_layers;
+      log(`  Loaded ${CONFIG.num_layers} transformer layers`);
+      log(`  Dequantized weights: ${(totalQ8 / 1e6).toFixed(1)}MB → ${(totalF32 / 1e6).toFixed(1)}MB f32`);
+    }
+
+    // =========================================================================
+    // Create work buffers and KV caches
+    // =========================================================================
+    function createWorkBuffers() {
+      const H = CONFIG.hidden_size;       // 640
+      const Q = CONFIG.q_dim;             // 1024
+      const KV = CONFIG.kv_dim;           // 256
+      const I = CONFIG.intermediate_size; // 2048
+      const MAX_SEQ = CONFIG.context_length;
+      const V = CONFIG.vocab_size;
+      const HD = CONFIG.head_dim;         // 256
+      const NQH = CONFIG.num_q_heads;     // 4
+      const NKH = CONFIG.num_kv_heads;    // 1
+
+      // COPY_SRC on all work buffers for debugging readbacks
+      const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC;
+      const SD = S | GPUBufferUsage.COPY_DST;
+      workBuffers = {
+        hidden: device.createBuffer({ size: H * 4, usage: SD }),
+        hiddenReadback: device.createBuffer({ size: H * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+        residual: device.createBuffer({ size: H * 4, usage: S }),
+        normed: device.createBuffer({ size: H * 4, usage: S }),
+        q: device.createBuffer({ size: Q * 4, usage: S }),        // 1024 floats
+        k: device.createBuffer({ size: KV * 4, usage: S }),       // 256 floats
+        v: device.createBuffer({ size: KV * 4, usage: S }),       // 256 floats
+        attnOut: device.createBuffer({ size: Q * 4, usage: S }),   // 1024 floats (4 heads * 256)
+        attnProj: device.createBuffer({ size: H * 4, usage: S }), // 640 floats (after output proj)
+        postAttnNormed: device.createBuffer({ size: H * 4, usage: S }), // post-attention norm output
+        attnScores: device.createBuffer({ size: NQH * MAX_SEQ * 4, usage: S }), // 4 * 128
+        ffnGate: device.createBuffer({ size: I * 4, usage: S }),
+        ffnUp: device.createBuffer({ size: I * 4, usage: S }),
+        ffnMul: device.createBuffer({ size: I * 4, usage: S }),
+        ffnDown: device.createBuffer({ size: H * 4, usage: S }),
+        postFfnNormed: device.createBuffer({ size: H * 4, usage: S }), // post-ffn norm output
+        // LM Head buffers
+        logits: device.createBuffer({ size: V * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
+        logitsReadback: device.createBuffer({ size: V * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+        argmaxResult: device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
+        argmaxReadback: device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+        // Top-K 256: each thread finds its local max → 256 candidates (val, id pairs)
+        topk256Result: device.createBuffer({ size: 256 * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
+        topk256Readback: device.createBuffer({ size: 256 * 2 * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+      };
+
+      // KV caches per layer: [max_seq, num_kv_heads, head_dim] = [128, 1, 256]
+      const kvSize = MAX_SEQ * NKH * HD * 4;
+      kvCaches = [];
+      for (let i = 0; i < CONFIG.num_layers; i++) {
+        kvCaches.push({
+          k: device.createBuffer({ size: kvSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC }),
+          v: device.createBuffer({ size: kvSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC }),
+        });
+      }
+
+      log(`  Created work buffers and ${CONFIG.num_layers} KV caches`);
+      log(`  Q buffer: ${Q} floats (${Q * 4} bytes)`);
+      log(`  KV cache per layer: ${MAX_SEQ} * ${NKH} * ${HD} = ${MAX_SEQ * NKH * HD} floats (${kvSize} bytes)`);
+      log(`  Logits buffer: ${(V * 4 / 1e6).toFixed(1)}MB`);
+    }
+
+    // =========================================================================
+    // Pre-create bind groups for the entire forward pass
+    // =========================================================================
+    let bindGroupCache = null;
+
+    function createBindGroups() {
+      bindGroupCache = {
+        layers: [],
+      };
+
+      // Embedding lookup bind group
+      bindGroupCache.embeddingLookup = device.createBindGroup({
+        layout: pipelines.embeddingLookup.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: modelBuffers.embedding } },
+          { binding: 1, resource: { buffer: workBuffers.hidden } },
+          { binding: 2, resource: { buffer: uniformBuffers.embeddingLookup } },
+        ],
+      });
+
+      // Final norm
+      bindGroupCache.finalNorm = device.createBindGroup({
+        layout: pipelines.rmsNorm.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: workBuffers.hidden } },
+          { binding: 1, resource: { buffer: modelBuffers.finalNorm } },
+          { binding: 2, resource: { buffer: workBuffers.normed } },
+          { binding: 3, resource: { buffer: uniformBuffers.rmsNorm } },
+        ],
+      });
+
+      // LM Head bind group — f32 version (more precise for final logit computation)
+      bindGroupCache.lmHead = device.createBindGroup({
+        layout: pipelines.lmHead.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: workBuffers.normed } },
+          { binding: 1, resource: { buffer: modelBuffers.embedding } },
+          { binding: 2, resource: { buffer: workBuffers.logits } },
+          { binding: 3, resource: { buffer: uniformBuffers.linearQ8_V_H } }, // params: {V, H}
+        ],
+      });
+
+      // NOTE: lmHeadQ8 bind group removed — was unused, and Q8_0 packed embedding
+      // is incompatible with linearF32 layout. LM head uses f32 pipeline above.
+
+      // Argmax bind group
+      bindGroupCache.argmax = device.createBindGroup({
+        layout: pipelines.argmax.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: workBuffers.logits } },
+          { binding: 1, resource: { buffer: workBuffers.argmaxResult } },
+          { binding: 2, resource: { buffer: uniformBuffers.argmaxSize } },
+        ],
+      });
+
+      bindGroupCache.topk256 = device.createBindGroup({
+        layout: pipelines.topk256.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: workBuffers.logits } },
+          { binding: 1, resource: { buffer: workBuffers.topk256Result } },
+          { binding: 2, resource: { buffer: uniformBuffers.argmaxSize } },
+        ],
+      });
+
+      for (let i = 0; i < CONFIG.num_layers; i++) {
+        const layer = modelBuffers.layers[i];
+        const kv = kvCaches[i];
+        const lb = {};
+
+        // Pre-attention RMS norm: hidden -> normed
+        lb.attnNorm = device.createBindGroup({
+          layout: pipelines.rmsNorm.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.hidden } },
+            { binding: 1, resource: { buffer: layer.attn_norm } },
+            { binding: 2, resource: { buffer: workBuffers.normed } },
+            { binding: 3, resource: { buffer: uniformBuffers.rmsNorm } },
+          ],
+        });
+
+        // Q projection: normed [640] -> q [1024]
+        lb.linearQ = device.createBindGroup({
+          layout: pipelines.linearQ8.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.normed } },
+            { binding: 1, resource: { buffer: layer.attn_q } },
+            { binding: 2, resource: { buffer: workBuffers.q } },
+            { binding: 3, resource: { buffer: uniformBuffers.linearQ8_Q_H } },
+          ],
+        });
+
+        // NOTE: Fused attnNorm+Q and ffnNorm+gate bind groups removed —
+        // they assumed Q8_0 packed weights. Can be re-added with fusedNormLinearQ8 shader.
+
+        // K projection: normed [640] -> k [256]
+        lb.linearK = device.createBindGroup({
+          layout: pipelines.linearQ8.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.normed } },
+            { binding: 1, resource: { buffer: layer.attn_k } },
+            { binding: 2, resource: { buffer: workBuffers.k } },
+            { binding: 3, resource: { buffer: uniformBuffers.linearQ8_KV_H } },
+          ],
+        });
+
+        // V projection: normed [640] -> v [256]
+        lb.linearV = device.createBindGroup({
+          layout: pipelines.linearQ8.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.normed } },
+            { binding: 1, resource: { buffer: layer.attn_v } },
+            { binding: 2, resource: { buffer: workBuffers.v } },
+            { binding: 3, resource: { buffer: uniformBuffers.linearQ8_KV_H } },
+          ],
+        });
+
+        // RoPE on Q (4 heads, head_dim=256) - per-layer theta
+        lb.ropeQ = device.createBindGroup({
+          layout: pipelines.rope.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.q } },
+            { binding: 1, resource: { buffer: uniformBuffers.ropeQ[i] } },
+          ],
+        });
+
+        // RoPE on K (1 head, head_dim=256) - per-layer theta
+        lb.ropeK = device.createBindGroup({
+          layout: pipelines.rope.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.k } },
+            { binding: 1, resource: { buffer: uniformBuffers.ropeK[i] } },
+          ],
+        });
+
+        // Per-head RMS norm on Q (4 heads of 256)
+        lb.qNorm = device.createBindGroup({
+          layout: pipelines.perHeadRmsNorm.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.q } },
+            { binding: 1, resource: { buffer: layer.attn_q_norm } },
+            { binding: 2, resource: { buffer: uniformBuffers.perHeadRmsNormQ } },
+          ],
+        });
+
+        // Per-head RMS norm on K (1 head of 256)
+        lb.kNorm = device.createBindGroup({
+          layout: pipelines.perHeadRmsNorm.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.k } },
+            { binding: 1, resource: { buffer: layer.attn_k_norm } },
+            { binding: 2, resource: { buffer: uniformBuffers.perHeadRmsNormK } },
+          ],
+        });
+
+        // Fused per-head norm + RoPE on Q (saves 1 dispatch boundary)
+        lb.fusedNormRopeQ = device.createBindGroup({
+          layout: pipelines.fusedPerHeadNormRope.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.q } },
+            { binding: 1, resource: { buffer: layer.attn_q_norm } },
+            { binding: 2, resource: { buffer: uniformBuffers.fusedNormRopeQ[i] } },
+          ],
+        });
+
+        // Fused per-head norm + RoPE on K (saves 1 dispatch boundary)
+        lb.fusedNormRopeK = device.createBindGroup({
+          layout: pipelines.fusedPerHeadNormRope.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.k } },
+            { binding: 1, resource: { buffer: layer.attn_k_norm } },
+            { binding: 2, resource: { buffer: uniformBuffers.fusedNormRopeK[i] } },
+          ],
+        });
+
+        // KV cache store
+        lb.kvStore = device.createBindGroup({
+          layout: pipelines.kvCacheStore.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.k } },
+            { binding: 1, resource: { buffer: workBuffers.v } },
+            { binding: 2, resource: { buffer: kv.k } },
+            { binding: 3, resource: { buffer: kv.v } },
+            { binding: 4, resource: { buffer: uniformBuffers.kvCacheStore } },
+          ],
+        });
+
+        // Attention scores
+        lb.attnScore = device.createBindGroup({
+          layout: pipelines.attnScore.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.q } },
+            { binding: 1, resource: { buffer: kv.k } },
+            { binding: 2, resource: { buffer: workBuffers.attnScores } },
+            { binding: 3, resource: { buffer: uniformBuffers.attnScore } },
+          ],
+        });
+
+        // Softmax
+        lb.softmax = device.createBindGroup({
+          layout: pipelines.softmax.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.attnScores } },
+            { binding: 1, resource: { buffer: uniformBuffers.softmax } },
+          ],
+        });
+
+        // Attention output: probs @ V -> attnOut [1024]
+        lb.attnOutput = device.createBindGroup({
+          layout: pipelines.attnOutput.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.attnScores } },
+            { binding: 1, resource: { buffer: kv.v } },
+            { binding: 2, resource: { buffer: workBuffers.attnOut } },
+            { binding: 3, resource: { buffer: uniformBuffers.attnOutput } },
+          ],
+        });
+
+        // Output projection: attnOut [1024] -> attnProj [640]
+        lb.linearAttnOut = device.createBindGroup({
+          layout: pipelines.linearQ8.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.attnOut } },
+            { binding: 1, resource: { buffer: layer.attn_output } },
+            { binding: 2, resource: { buffer: workBuffers.attnProj } },
+            { binding: 3, resource: { buffer: uniformBuffers.linearQ8_H_Q } },
+          ],
+        });
+
+        // Post-attention norm: attnProj [640] -> postAttnNormed [640]
+        lb.postAttnNorm = device.createBindGroup({
+          layout: pipelines.rmsNorm.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.attnProj } },
+            { binding: 1, resource: { buffer: layer.post_attention_norm } },
+            { binding: 2, resource: { buffer: workBuffers.postAttnNormed } },
+            { binding: 3, resource: { buffer: uniformBuffers.rmsNorm } },
+          ],
+        });
+
+        // Residual add: hidden + postAttnNormed -> residual
+        lb.residualAdd1 = device.createBindGroup({
+          layout: pipelines.add.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.hidden } },
+            { binding: 1, resource: { buffer: workBuffers.postAttnNormed } },
+            { binding: 2, resource: { buffer: workBuffers.residual } },
+            { binding: 3, resource: { buffer: uniformBuffers.sizeH } },
+          ],
+        });
+
+        // FFN norm: residual -> normed
+        lb.ffnNorm = device.createBindGroup({
+          layout: pipelines.rmsNorm.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.residual } },
+            { binding: 1, resource: { buffer: layer.ffn_norm } },
+            { binding: 2, resource: { buffer: workBuffers.normed } },
+            { binding: 3, resource: { buffer: uniformBuffers.rmsNorm } },
+          ],
+        });
+
+        // FFN gate
+        lb.ffnGate = device.createBindGroup({
+          layout: pipelines.linearQ8.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.normed } },
+            { binding: 1, resource: { buffer: layer.ffn_gate } },
+            { binding: 2, resource: { buffer: workBuffers.ffnGate } },
+            { binding: 3, resource: { buffer: uniformBuffers.linearQ8_I_H } },
+          ],
+        });
+
+        // FFN up
+        lb.ffnUp = device.createBindGroup({
+          layout: pipelines.linearQ8.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.normed } },
+            { binding: 1, resource: { buffer: layer.ffn_up } },
+            { binding: 2, resource: { buffer: workBuffers.ffnUp } },
+            { binding: 3, resource: { buffer: uniformBuffers.linearQ8_I_H } },
+          ],
+        });
+
+        // Fused SiLU * Mul
+        lb.siluMul = device.createBindGroup({
+          layout: pipelines.siluMul.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.ffnGate } },
+            { binding: 1, resource: { buffer: workBuffers.ffnUp } },
+            { binding: 2, resource: { buffer: workBuffers.ffnMul } },
+            { binding: 3, resource: { buffer: uniformBuffers.sizeI } },
+          ],
+        });
+
+        // FFN down
+        lb.ffnDown = device.createBindGroup({
+          layout: pipelines.linearQ8.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.ffnMul } },
+            { binding: 1, resource: { buffer: layer.ffn_down } },
+            { binding: 2, resource: { buffer: workBuffers.ffnDown } },
+            { binding: 3, resource: { buffer: uniformBuffers.linearQ8_H_I } },
+          ],
+        });
+
+        // Post-FFN norm: ffnDown [640] -> postFfnNormed [640]
+        lb.postFfnNorm = device.createBindGroup({
+          layout: pipelines.rmsNorm.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.ffnDown } },
+            { binding: 1, resource: { buffer: layer.post_ffw_norm } },
+            { binding: 2, resource: { buffer: workBuffers.postFfnNormed } },
+            { binding: 3, resource: { buffer: uniformBuffers.rmsNorm } },
+          ],
+        });
+
+        // Residual add: residual + postFfnNormed -> hidden
+        lb.residualAdd2 = device.createBindGroup({
+          layout: pipelines.add.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.residual } },
+            { binding: 1, resource: { buffer: workBuffers.postFfnNormed } },
+            { binding: 2, resource: { buffer: workBuffers.hidden } },
+            { binding: 3, resource: { buffer: uniformBuffers.sizeH } },
+          ],
+        });
+
+        // Fused post-attention norm + residual add (saves 1 dispatch boundary)
+        // out = hidden + norm(attnProj, post_attention_norm_weight)
+        lb.fusedPostAttnNormAdd = device.createBindGroup({
+          layout: pipelines.fusedNormAdd.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.attnProj } },
+            { binding: 1, resource: { buffer: layer.post_attention_norm } },
+            { binding: 2, resource: { buffer: workBuffers.hidden } },
+            { binding: 3, resource: { buffer: workBuffers.residual } },
+            { binding: 4, resource: { buffer: uniformBuffers.rmsNorm } },
+          ],
+        });
+
+        // Fused post-FFN norm + residual add (saves 1 dispatch boundary)
+        // out = residual + norm(ffnDown, post_ffw_norm_weight)
+        lb.fusedPostFfnNormAdd = device.createBindGroup({
+          layout: pipelines.fusedNormAdd.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: workBuffers.ffnDown } },
+            { binding: 1, resource: { buffer: layer.post_ffw_norm } },
+            { binding: 2, resource: { buffer: workBuffers.residual } },
+            { binding: 3, resource: { buffer: workBuffers.hidden } },
+            { binding: 4, resource: { buffer: uniformBuffers.rmsNorm } },
+          ],
+        });
+
+        bindGroupCache.layers.push(lb);
+      }
+
+      log(`  Pre-created bind groups for all ${CONFIG.num_layers} layers + lmHead + argmax`);
+    }
+
+    // =========================================================================
+    // Forward pass - single command encoder
+    // =========================================================================
+    async function forwardPass(tokenId, position) {
+      const H = CONFIG.hidden_size;       // 640
+      const Q = CONFIG.q_dim;             // 1024
+      const KV = CONFIG.kv_dim;           // 256
+      const I = CONFIG.intermediate_size; // 2048
+      const HD = CONFIG.head_dim;         // 256
+      const NQH = CONFIG.num_q_heads;     // 4
+      const NKH = CONFIG.num_kv_heads;    // 1
+      const MAX_SEQ = CONFIG.context_length;
+      const seqLen = position + 1;
+
+      // Write token_id into embedding lookup uniform
+      device.queue.writeBuffer(uniformBuffers.embeddingLookup, 4, new Uint32Array([tokenId]));
+
+      // Write position into per-layer RoPE and KV cache uniforms
+      const posU32 = new Uint32Array([position]);
+      for (let il = 0; il < CONFIG.num_layers; il++) {
+        device.queue.writeBuffer(uniformBuffers.ropeQ[il], 8, posU32);
+        device.queue.writeBuffer(uniformBuffers.ropeK[il], 8, posU32);
+      }
+      device.queue.writeBuffer(uniformBuffers.kvCacheStore, 8, posU32);
+
+      // Write seq_len into attention uniforms
+      const seqU32 = new Uint32Array([seqLen]);
+      device.queue.writeBuffer(uniformBuffers.attnScore, 12, seqU32);
+      device.queue.writeBuffer(uniformBuffers.softmax, 4, seqU32);
+      device.queue.writeBuffer(uniformBuffers.attnOutput, 12, seqU32);
+
+      // Single command encoder for the entire forward pass
+      const encoder = device.createCommandEncoder();
+
+      // --- Embedding lookup on GPU ---
+      {
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.embeddingLookup);
+        pass.setBindGroup(0, bindGroupCache.embeddingLookup);
+        pass.dispatchWorkgroups(Math.ceil(H / 256));
+        pass.end();
+      }
+
+      // --- Process each transformer layer ---
+      for (let layerIdx = 0; layerIdx < CONFIG.num_layers; layerIdx++) {
+        const lb = bindGroupCache.layers[layerIdx];
+        let pass;
+
+        // 1. Pre-attention RMS norm: hidden -> normed
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.rmsNorm);
+        pass.setBindGroup(0, lb.attnNorm);
+        pass.dispatchWorkgroups(1);
+        pass.end();
+
+        // 2. Q projection (Q8_0): normed [640] -> q [1024]
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.linearQ8);
+        pass.setBindGroup(0, lb.linearQ);
+        pass.dispatchWorkgroups(Math.ceil(Q / 256));
+        pass.end();
+
+        // 3. K projection (Q8_0): normed [640] -> k [256]
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.linearQ8);
+        pass.setBindGroup(0, lb.linearK);
+        pass.dispatchWorkgroups(Math.ceil(KV / 256));
+        pass.end();
+
+        // 4. V projection (Q8_0): normed [640] -> v [256]
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.linearQ8);
+        pass.setBindGroup(0, lb.linearV);
+        pass.dispatchWorkgroups(Math.ceil(KV / 256));
+        pass.end();
+
+        // 5. Per-head RMS norm on Q (4 heads) — BEFORE RoPE (Gemma 3 order)
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.perHeadRmsNorm);
+        pass.setBindGroup(0, lb.qNorm);
+        pass.dispatchWorkgroups(NQH);
+        pass.end();
+
+        // 6. Per-head RMS norm on K (1 head) — BEFORE RoPE (Gemma 3 order)
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.perHeadRmsNorm);
+        pass.setBindGroup(0, lb.kNorm);
+        pass.dispatchWorkgroups(NKH);
+        pass.end();
+
+        // 7. RoPE on Q (4 heads, head_dim=256) — AFTER norms
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.rope);
+        pass.setBindGroup(0, lb.ropeQ);
+        pass.dispatchWorkgroups(Math.ceil((NQH * HD / 2) / 256));
+        pass.end();
+
+        // 8. RoPE on K (1 head, head_dim=256) — AFTER norms
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.rope);
+        pass.setBindGroup(0, lb.ropeK);
+        pass.dispatchWorkgroups(Math.ceil((NKH * HD / 2) / 256));
+        pass.end();
+
+        // 9. Store K, V in cache
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.kvCacheStore);
+        pass.setBindGroup(0, lb.kvStore);
+        pass.dispatchWorkgroups(Math.ceil(KV / 256));
+        pass.end();
+
+        // 10. Attention scores: Q @ K_cache^T / sqrt(256)
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.attnScore);
+        pass.setBindGroup(0, lb.attnScore);
+        pass.dispatchWorkgroups(Math.ceil((NQH * seqLen) / 256));
+        pass.end();
+
+        // 11. Softmax over scores (one workgroup per head)
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.softmax);
+        pass.setBindGroup(0, lb.softmax);
+        pass.dispatchWorkgroups(NQH);
+        pass.end();
+
+        // 12. Attention output: probs @ V_cache -> attnOut [1024]
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.attnOutput);
+        pass.setBindGroup(0, lb.attnOutput);
+        pass.dispatchWorkgroups(Math.ceil((NQH * HD) / 256));
+        pass.end();
+
+        // 13. Output projection (Q8_0): attnOut [1024] -> attnProj [640]
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.linearQ8);
+        pass.setBindGroup(0, lb.linearAttnOut);
+        pass.dispatchWorkgroups(Math.ceil(H / 256));
+        pass.end();
+
+        // 14. Post-attention RMS norm: attnProj -> postAttnNormed
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.rmsNorm);
+        pass.setBindGroup(0, lb.postAttnNorm);
+        pass.dispatchWorkgroups(1);
+        pass.end();
+
+        // 15. Residual add: hidden + postAttnNormed -> residual
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.add);
+        pass.setBindGroup(0, lb.residualAdd1);
+        pass.dispatchWorkgroups(Math.ceil(H / 256));
+        pass.end();
+
+        // 16. FFN norm: residual -> normed
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.rmsNorm);
+        pass.setBindGroup(0, lb.ffnNorm);
+        pass.dispatchWorkgroups(1);
+        pass.end();
+
+        // 17. FFN gate (Q8_0): normed [640] -> ffnGate [2048]
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.linearQ8);
+        pass.setBindGroup(0, lb.ffnGate);
+        pass.dispatchWorkgroups(Math.ceil(I / 256));
+        pass.end();
+
+        // 18. FFN up (Q8_0): normed [640] -> ffnUp [2048]
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.linearQ8);
+        pass.setBindGroup(0, lb.ffnUp);
+        pass.dispatchWorkgroups(Math.ceil(I / 256));
+        pass.end();
+
+        // 19. Fused SiLU * Mul
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.siluMul);
+        pass.setBindGroup(0, lb.siluMul);
+        pass.dispatchWorkgroups(Math.ceil(I / 256));
+        pass.end();
+
+        // 20. FFN down (Q8_0): ffnMul [2048] -> ffnDown [640]
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.linearQ8);
+        pass.setBindGroup(0, lb.ffnDown);
+        pass.dispatchWorkgroups(Math.ceil(H / 256));
+        pass.end();
+
+        // 21. Post-FFN RMS norm: ffnDown -> postFfnNormed
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.rmsNorm);
+        pass.setBindGroup(0, lb.postFfnNorm);
+        pass.dispatchWorkgroups(1);
+        pass.end();
+
+        // 22. Residual add: residual + postFfnNormed -> hidden
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.add);
+        pass.setBindGroup(0, lb.residualAdd2);
+        pass.dispatchWorkgroups(Math.ceil(H / 256));
+        pass.end();
+      }
+
+      // --- Final RMS norm ---
+      {
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.rmsNorm);
+        pass.setBindGroup(0, bindGroupCache.finalNorm);
+        pass.dispatchWorkgroups(1);
+        pass.end();
+      }
+
+      // Submit everything as ONE command buffer
+      device.queue.submit([encoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+    }
+
+    // =========================================================================
+    // FAST PATH: Combined forward pass + LM head + token selection
+    // Single command buffer, single submit, single await per token
+    // Uses Q8_0 LM head (3.5x less bandwidth than f32)
+    // =========================================================================
+    async function forwardPassAndGetToken(tokenId, position, temperature = 0, topP = 0.9, repPenalty = 1.0, generatedTokens = null) {
+      const H = CONFIG.hidden_size;
+      const Q = CONFIG.q_dim;
+      const KV = CONFIG.kv_dim;
+      const I = CONFIG.intermediate_size;
+      const HD = CONFIG.head_dim;
+      const NQH = CONFIG.num_q_heads;
+      const NKH = CONFIG.num_kv_heads;
+      const V = CONFIG.vocab_size;
+      const seqLen = position + 1;
+
+      // Write token_id into embedding lookup uniform
+      device.queue.writeBuffer(uniformBuffers.embeddingLookup, 4, new Uint32Array([tokenId]));
+
+      // Write position into fusedNormRope and legacy RoPE/KV cache uniforms
+      const posU32 = new Uint32Array([position]);
+      for (let il = 0; il < CONFIG.num_layers; il++) {
+        // Fused norm+rope uniforms: position at offset 12 (4th field)
+        device.queue.writeBuffer(uniformBuffers.fusedNormRopeQ[il], 12, posU32);
+        device.queue.writeBuffer(uniformBuffers.fusedNormRopeK[il], 12, posU32);
+      }
+      device.queue.writeBuffer(uniformBuffers.kvCacheStore, 8, posU32);
+
+      // Write seq_len into attention uniforms
+      const seqU32 = new Uint32Array([seqLen]);
+      device.queue.writeBuffer(uniformBuffers.attnScore, 12, seqU32);
+      device.queue.writeBuffer(uniformBuffers.softmax, 4, seqU32);
+      device.queue.writeBuffer(uniformBuffers.attnOutput, 12, seqU32);
+
+      // === SINGLE command encoder for everything ===
+      const encoder = device.createCommandEncoder();
+      let pass;
+
+      // --- Embedding lookup ---
+      pass = encoder.beginComputePass();
+      pass.setPipeline(pipelines.embeddingLookup);
+      pass.setBindGroup(0, bindGroupCache.embeddingLookup);
+      pass.dispatchWorkgroups(Math.ceil(H / 256));
+      pass.end();
+
+      // --- All 18 transformer layers (optimized: 14 passes/layer, was 17) ---
+      for (let layerIdx = 0; layerIdx < CONFIG.num_layers; layerIdx++) {
+        const lb = bindGroupCache.layers[layerIdx];
+
+        // 1. Pre-attention RMS norm
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb.attnNorm); pass.dispatchWorkgroups(1); pass.end();
+
+        // 2. Q+K+V projections (all read normed, write to separate buffers — no conflicts)
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.linearQ8);
+        pass.setBindGroup(0, lb.linearQ); pass.dispatchWorkgroups(Math.ceil(Q / 256));
+        pass.setBindGroup(0, lb.linearK); pass.dispatchWorkgroups(Math.ceil(KV / 256));
+        pass.setBindGroup(0, lb.linearV); pass.dispatchWorkgroups(Math.ceil(KV / 256));
+        pass.end();
+
+        // 3. Fused Q norm+RoPE + K norm+RoPE (each head: norm → rotate, separate buffers)
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.fusedPerHeadNormRope);
+        pass.setBindGroup(0, lb.fusedNormRopeQ); pass.dispatchWorkgroups(NQH);
+        pass.setBindGroup(0, lb.fusedNormRopeK); pass.dispatchWorkgroups(NKH);
+        pass.end();
+
+        // 4. KV cache store
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.kvCacheStore); pass.setBindGroup(0, lb.kvStore); pass.dispatchWorkgroups(Math.ceil(KV / 256)); pass.end();
+
+        // 5-7. Attention: score → softmax → output
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.attnScore); pass.setBindGroup(0, lb.attnScore); pass.dispatchWorkgroups(Math.ceil((NQH * seqLen) / 256)); pass.end();
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.softmax); pass.setBindGroup(0, lb.softmax); pass.dispatchWorkgroups(NQH); pass.end();
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.attnOutput); pass.setBindGroup(0, lb.attnOutput); pass.dispatchWorkgroups(Math.ceil((NQH * HD) / 256)); pass.end();
+
+        // 8. Output projection
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.linearAttnOut); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+
+        // 9. Fused post-attention norm + residual add (was 2 passes, now 1)
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.fusedNormAdd); pass.setBindGroup(0, lb.fusedPostAttnNormAdd); pass.dispatchWorkgroups(1); pass.end();
+
+        // 10. FFN norm
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb.ffnNorm); pass.dispatchWorkgroups(1); pass.end();
+
+        // 11. FFN gate + up (both read normed, write to separate buffers)
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.linearQ8);
+        pass.setBindGroup(0, lb.ffnGate); pass.dispatchWorkgroups(Math.ceil(I / 256));
+        pass.setBindGroup(0, lb.ffnUp); pass.dispatchWorkgroups(Math.ceil(I / 256));
+        pass.end();
+
+        // 12. GeGLU activation
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.siluMul); pass.setBindGroup(0, lb.siluMul); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
+
+        // 13. FFN down
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.ffnDown); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+
+        // 14. Fused post-FFN norm + residual add (was 2 passes, now 1)
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.fusedNormAdd); pass.setBindGroup(0, lb.fusedPostFfnNormAdd); pass.dispatchWorkgroups(1); pass.end();
+      }
+
+      // --- Final RMS norm ---
+      pass = encoder.beginComputePass();
+      pass.setPipeline(pipelines.rmsNorm);
+      pass.setBindGroup(0, bindGroupCache.finalNorm);
+      pass.dispatchWorkgroups(1);
+      pass.end();
+
+      // --- LM Head (f32 — Q8_0 is too lossy for 262K vocab, causes wrong token selection) ---
+      pass = encoder.beginComputePass();
+      pass.setPipeline(pipelines.lmHead);
+      pass.setBindGroup(0, bindGroupCache.lmHead);
+      pass.dispatchWorkgroups(Math.ceil(V / 256));
+      pass.end();
+
+      // --- Token selection ---
+      const useGreedyFast = (temperature === 0 && repPenalty <= 1.0);
+
+      if (useGreedyFast) {
+        // GPU argmax + readback in same command buffer
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.argmax);
+        pass.setBindGroup(0, bindGroupCache.argmax);
+        pass.dispatchWorkgroups(1);
+        pass.end();
+        encoder.copyBufferToBuffer(workBuffers.argmaxResult, 0, workBuffers.argmaxReadback, 0, 4);
+      } else {
+        // GPU top-256 + readback for CPU sampling
+        pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.topk256);
+        pass.setBindGroup(0, bindGroupCache.topk256);
+        pass.dispatchWorkgroups(1);
+        pass.end();
+        encoder.copyBufferToBuffer(workBuffers.topk256Result, 0, workBuffers.topk256Readback, 0, 256 * 2 * 4);
+      }
+
+      // === SINGLE submit — mapAsync waits implicitly, no need for onSubmittedWorkDone ===
+      device.queue.submit([encoder.finish()]);
+
+      if (useGreedyFast) {
+        await workBuffers.argmaxReadback.mapAsync(GPUMapMode.READ);
+        const resultArray = new Uint32Array(workBuffers.argmaxReadback.getMappedRange());
+        const tokenResult = resultArray[0];
+        workBuffers.argmaxReadback.unmap();
+        return tokenResult;
+      }
+
+      // CPU sampling path
+      await workBuffers.topk256Readback.mapAsync(GPUMapMode.READ);
+      const topkData = new Float32Array(workBuffers.topk256Readback.getMappedRange().slice(0));
+      workBuffers.topk256Readback.unmap();
+
+      // Unpack 256 (value, id) pairs
+      const candidates = new Array(256);
+      const topkU32 = new Uint32Array(topkData.buffer.slice(0));
+      for (let i = 0; i < 256; i++) {
+        candidates[i] = { val: topkData[i * 2], id: topkU32[i * 2 + 1] };
+      }
+
+      // Apply repetition penalty
+      if (repPenalty > 1.0 && generatedTokens && generatedTokens.length > 0) {
+        const seen = new Set(generatedTokens);
+        for (let i = 0; i < 256; i++) {
+          if (seen.has(candidates[i].id)) {
+            if (candidates[i].val > 0) candidates[i].val /= repPenalty;
+            else candidates[i].val *= repPenalty;
+          }
+        }
+      }
+
+      candidates.sort((a, b) => b.val - a.val);
+
+      if (temperature === 0) return candidates[0].id;
+
+      // Temperature + softmax
+      const maxLogit = candidates[0].val;
+      let sumExp = 0;
+      const probs = new Float32Array(256);
+      for (let i = 0; i < 256; i++) {
+        probs[i] = Math.exp((candidates[i].val - maxLogit) / temperature);
+        sumExp += probs[i];
+      }
+
+      // Top-p filtering + sampling
+      let cumProb = 0, cutoff = 256;
+      for (let i = 0; i < 256; i++) {
+        cumProb += probs[i] / sumExp;
+        if (cumProb >= topP) { cutoff = i + 1; break; }
+      }
+      let subsetSum = 0;
+      for (let i = 0; i < cutoff; i++) subsetSum += probs[i];
+      let r = Math.random() * subsetSum;
+      for (let i = 0; i < cutoff; i++) {
+        r -= probs[i];
+        if (r <= 0) return candidates[i].id;
+      }
+      return candidates[cutoff - 1].id;
+    }
+
+    // Fast prefill-only path (no LM head needed during prefill except last token)
+    async function forwardPassOnly(tokenId, position) {
+      const H = CONFIG.hidden_size;
+      const Q = CONFIG.q_dim;
+      const KV = CONFIG.kv_dim;
+      const I = CONFIG.intermediate_size;
+      const HD = CONFIG.head_dim;
+      const NQH = CONFIG.num_q_heads;
+      const NKH = CONFIG.num_kv_heads;
+      const seqLen = position + 1;
+
+      // Write token_id into embedding lookup uniform
+      device.queue.writeBuffer(uniformBuffers.embeddingLookup, 4, new Uint32Array([tokenId]));
+
+      // Write position into fusedNormRope and legacy KV cache uniforms
+      const posU32 = new Uint32Array([position]);
+      for (let il = 0; il < CONFIG.num_layers; il++) {
+        device.queue.writeBuffer(uniformBuffers.fusedNormRopeQ[il], 12, posU32);
+        device.queue.writeBuffer(uniformBuffers.fusedNormRopeK[il], 12, posU32);
+      }
+      device.queue.writeBuffer(uniformBuffers.kvCacheStore, 8, posU32);
+
+      // Write seq_len into attention uniforms
+      const seqU32 = new Uint32Array([seqLen]);
+      device.queue.writeBuffer(uniformBuffers.attnScore, 12, seqU32);
+      device.queue.writeBuffer(uniformBuffers.softmax, 4, seqU32);
+      device.queue.writeBuffer(uniformBuffers.attnOutput, 12, seqU32);
+
+      const encoder = device.createCommandEncoder();
+      let pass;
+
+      pass = encoder.beginComputePass();
+      pass.setPipeline(pipelines.embeddingLookup);
+      pass.setBindGroup(0, bindGroupCache.embeddingLookup);
+      pass.dispatchWorkgroups(Math.ceil(H / 256));
+      pass.end();
+
+      for (let layerIdx = 0; layerIdx < CONFIG.num_layers; layerIdx++) {
+        const lb = bindGroupCache.layers[layerIdx];
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb.attnNorm); pass.dispatchWorkgroups(1); pass.end();
+        // Fused Q+K+V projections
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.linearQ8);
+        pass.setBindGroup(0, lb.linearQ); pass.dispatchWorkgroups(Math.ceil(Q / 256));
+        pass.setBindGroup(0, lb.linearK); pass.dispatchWorkgroups(Math.ceil(KV / 256));
+        pass.setBindGroup(0, lb.linearV); pass.dispatchWorkgroups(Math.ceil(KV / 256));
+        pass.end();
+        // Fused norm+RoPE Q+K
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.fusedPerHeadNormRope);
+        pass.setBindGroup(0, lb.fusedNormRopeQ); pass.dispatchWorkgroups(NQH);
+        pass.setBindGroup(0, lb.fusedNormRopeK); pass.dispatchWorkgroups(NKH);
+        pass.end();
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.kvCacheStore); pass.setBindGroup(0, lb.kvStore); pass.dispatchWorkgroups(Math.ceil(KV / 256)); pass.end();
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.attnScore); pass.setBindGroup(0, lb.attnScore); pass.dispatchWorkgroups(Math.ceil((NQH * seqLen) / 256)); pass.end();
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.softmax); pass.setBindGroup(0, lb.softmax); pass.dispatchWorkgroups(NQH); pass.end();
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.attnOutput); pass.setBindGroup(0, lb.attnOutput); pass.dispatchWorkgroups(Math.ceil((NQH * HD) / 256)); pass.end();
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.linearAttnOut); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+        // Fused post-attn norm + residual add
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.fusedNormAdd); pass.setBindGroup(0, lb.fusedPostAttnNormAdd); pass.dispatchWorkgroups(1); pass.end();
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb.ffnNorm); pass.dispatchWorkgroups(1); pass.end();
+        // Fused gate+up
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.linearQ8);
+        pass.setBindGroup(0, lb.ffnGate); pass.dispatchWorkgroups(Math.ceil(I / 256));
+        pass.setBindGroup(0, lb.ffnUp); pass.dispatchWorkgroups(Math.ceil(I / 256));
+        pass.end();
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.siluMul); pass.setBindGroup(0, lb.siluMul); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.ffnDown); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+        // Fused post-FFN norm + residual add
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.fusedNormAdd); pass.setBindGroup(0, lb.fusedPostFfnNormAdd); pass.dispatchWorkgroups(1); pass.end();
+      }
+
+      pass = encoder.beginComputePass();
+      pass.setPipeline(pipelines.rmsNorm);
+      pass.setBindGroup(0, bindGroupCache.finalNorm);
+      pass.dispatchWorkgroups(1);
+      pass.end();
+
+      device.queue.submit([encoder.finish()]);
+      // No await here — caller can batch multiple prefill tokens before awaiting
+    }
+
+    // Batched prefill: submit all tokens without awaiting between them
+    async function prefillBatched(tokens) {
+      for (let i = 0; i < tokens.length; i++) {
+        forwardPassOnly(tokens[i], i);
+      }
+      // Single await for all prefill tokens
+      await device.queue.onSubmittedWorkDone();
+    }
+
+    // =========================================================================
+    // LM Head + Token Selection (argmax or sampling) — LEGACY (for debug only)
+    // =========================================================================
+
+    // Top-p (nucleus) sampling on CPU
+    // Optimized: uses top-K pre-filter (O(N)) instead of full sort (O(N log N))
+    function sampleTopP(logits, temperature, topP) {
+      const V = logits.length;
+
+      // Temperature=0 means greedy
+      if (temperature === 0) {
+        let maxVal = -Infinity, maxIdx = 0;
+        for (let i = 0; i < V; i++) {
+          if (logits[i] > maxVal) { maxVal = logits[i]; maxIdx = i; }
+        }
+        return maxIdx;
+      }
+
+      // Find max logit for numerical stability (single pass)
+      let maxLogit = -Infinity;
+      for (let i = 0; i < V; i++) if (logits[i] > maxLogit) maxLogit = logits[i];
+
+      // Apply temperature + compute exp in one pass, and find top-K candidates
+      // With temperature 0.7 and top-p 0.9, we typically need <50 tokens
+      // Keep top 512 candidates via a min-heap-like approach (linear scan with threshold)
+      const K = 512;
+      const topIds = new Uint32Array(K);
+      const topVals = new Float32Array(K);
+      let topCount = 0;
+      let minTopVal = -Infinity;
+      let minTopIdx = 0;
+      let sumExp = 0;
+
+      for (let i = 0; i < V; i++) {
+        const expVal = Math.exp((logits[i] / temperature) - (maxLogit / temperature));
+        sumExp += expVal;
+
+        if (topCount < K) {
+          topIds[topCount] = i;
+          topVals[topCount] = expVal;
+          if (topCount === 0 || expVal < minTopVal) {
+            minTopVal = expVal;
+            minTopIdx = topCount;
+          }
+          topCount++;
+        } else if (expVal > minTopVal) {
+          topIds[minTopIdx] = i;
+          topVals[minTopIdx] = expVal;
+          // Find new min
+          minTopVal = topVals[0]; minTopIdx = 0;
+          for (let j = 1; j < K; j++) {
+            if (topVals[j] < minTopVal) { minTopVal = topVals[j]; minTopIdx = j; }
+          }
+        }
+      }
+
+      // Sort top-K candidates by probability descending (only 512 elements!)
+      const sortIndices = Array.from({length: topCount}, (_, i) => i);
+      sortIndices.sort((a, b) => topVals[b] - topVals[a]);
+
+      // Top-p filtering: accumulate until cumulative prob >= topP
+      let cumProb = 0;
+      let cutoff = topCount;
+      for (let i = 0; i < topCount; i++) {
+        cumProb += topVals[sortIndices[i]] / sumExp;
+        if (cumProb >= topP) {
+          cutoff = i + 1;
+          break;
+        }
+      }
+
+      // Sample from the filtered subset
+      let subsetSum = 0;
+      for (let i = 0; i < cutoff; i++) subsetSum += topVals[sortIndices[i]];
+
+      let r = Math.random() * subsetSum;
+      for (let i = 0; i < cutoff; i++) {
+        r -= topVals[sortIndices[i]];
+        if (r <= 0) return topIds[sortIndices[i]];
+      }
+      return topIds[sortIndices[cutoff - 1]]; // fallback
+    }
+
+    async function lmHeadAndArgmax(temperature = 0, topP = 0.9, repPenalty = 1.0, generatedTokens = null) {
+      const V = CONFIG.vocab_size;
+
+      const encoder = device.createCommandEncoder();
+
+      // LM Head (f32): normed [H] -> logits [V] via f32 embedding
+      {
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.lmHead);
+        pass.setBindGroup(0, bindGroupCache.lmHead);
+        pass.dispatchWorkgroups(Math.ceil(V / 256));
+        pass.end();
+      }
+
+      // Fast path: greedy with no repetition penalty → GPU argmax
+      if (temperature === 0 && repPenalty <= 1.0) {
+        {
+          const pass = encoder.beginComputePass();
+          pass.setPipeline(pipelines.argmax);
+          pass.setBindGroup(0, bindGroupCache.argmax);
+          pass.dispatchWorkgroups(1);
+          pass.end();
+        }
+
+        encoder.copyBufferToBuffer(workBuffers.argmaxResult, 0, workBuffers.argmaxReadback, 0, 4);
+        device.queue.submit([encoder.finish()]);
+        await device.queue.onSubmittedWorkDone();
+
+        await workBuffers.argmaxReadback.mapAsync(GPUMapMode.READ);
+        const resultArray = new Uint32Array(workBuffers.argmaxReadback.getMappedRange());
+        const tokenId = resultArray[0];
+        workBuffers.argmaxReadback.unmap();
+        return tokenId;
+      }
+
+      // CPU sampling path: GPU top-256 → apply repetition penalty → sample/argmax
+      {
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(pipelines.topk256);
+        pass.setBindGroup(0, bindGroupCache.topk256);
+        pass.dispatchWorkgroups(1);
+        pass.end();
+      }
+
+      encoder.copyBufferToBuffer(workBuffers.topk256Result, 0, workBuffers.topk256Readback, 0, 256 * 2 * 4);
+      device.queue.submit([encoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+
+      await workBuffers.topk256Readback.mapAsync(GPUMapMode.READ);
+      const topkData = new Float32Array(workBuffers.topk256Readback.getMappedRange().slice(0));
+      workBuffers.topk256Readback.unmap();
+
+      // Unpack 256 (value, id) pairs
+      const candidates = new Array(256);
+      const topkU32 = new Uint32Array(topkData.buffer.slice(0));
+      for (let i = 0; i < 256; i++) {
+        candidates[i] = { val: topkData[i * 2], id: topkU32[i * 2 + 1] };
+      }
+
+      // Apply repetition penalty: penalize tokens that already appeared
+      if (repPenalty > 1.0 && generatedTokens && generatedTokens.length > 0) {
+        const seen = new Set(generatedTokens);
+        for (let i = 0; i < 256; i++) {
+          if (seen.has(candidates[i].id)) {
+            // Standard HF/llama.cpp repetition penalty:
+            // If logit > 0: logit /= penalty  (make less likely)
+            // If logit < 0: logit *= penalty  (make even less likely)
+            if (candidates[i].val > 0) {
+              candidates[i].val /= repPenalty;
+            } else {
+              candidates[i].val *= repPenalty;
+            }
+          }
+        }
+      }
+
+      // Sort by (penalized) value descending
+      candidates.sort((a, b) => b.val - a.val);
+
+      // Greedy with repetition penalty: just pick the top candidate
+      if (temperature === 0) {
+        return candidates[0].id;
+      }
+
+      // Apply temperature + softmax over candidates
+      const maxLogit = candidates[0].val;
+      let sumExp = 0;
+      const probs = new Float32Array(256);
+      for (let i = 0; i < 256; i++) {
+        probs[i] = Math.exp((candidates[i].val - maxLogit) / temperature);
+        sumExp += probs[i];
+      }
+
+      // Top-p filtering
+      let cumProb = 0;
+      let cutoff = 256;
+      for (let i = 0; i < 256; i++) {
+        cumProb += probs[i] / sumExp;
+        if (cumProb >= topP) { cutoff = i + 1; break; }
+      }
+
+      // Sample from filtered subset
+      let subsetSum = 0;
+      for (let i = 0; i < cutoff; i++) subsetSum += probs[i];
+      let r = Math.random() * subsetSum;
+      for (let i = 0; i < cutoff; i++) {
+        r -= probs[i];
+        if (r <= 0) return candidates[i].id;
+      }
+      return candidates[cutoff - 1].id;
+    }
+
+    // Debug: read back any buffer
+    async function readBackBuffer(buffer, size, label) {
+      const rb = device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(buffer, 0, rb, 0, size);
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      await rb.mapAsync(GPUMapMode.READ);
+      const data = new Float32Array(rb.getMappedRange().slice(0));
+      rb.unmap();
+      rb.destroy();
+      log(`${label}: [${data.slice(0, 10).map(v => v.toFixed(4)).join(', ')}]`);
+      return data;
+    }
+
+    // Debug forward pass: runs layer 0 step by step with readbacks
+    async function debugForwardPass(tokenId, position) {
+      const H = CONFIG.hidden_size;
+      const Q = CONFIG.q_dim;
+      const KV = CONFIG.kv_dim;
+      const NQH = CONFIG.num_q_heads;
+      const NKH = CONFIG.num_kv_heads;
+      const HD = CONFIG.head_dim;
+      const seqLen = position + 1;
+
+      // Update uniforms
+      device.queue.writeBuffer(uniformBuffers.embeddingLookup, 4, new Uint32Array([tokenId]));
+      for (let il = 0; il < CONFIG.num_layers; il++) {
+        device.queue.writeBuffer(uniformBuffers.ropeQ[il], 8, new Uint32Array([position]));
+        device.queue.writeBuffer(uniformBuffers.ropeK[il], 8, new Uint32Array([position]));
+      }
+      device.queue.writeBuffer(uniformBuffers.kvCacheStore, 8, new Uint32Array([position]));
+      device.queue.writeBuffer(uniformBuffers.attnScore, 12, new Uint32Array([seqLen]));
+      device.queue.writeBuffer(uniformBuffers.softmax, 4, new Uint32Array([seqLen]));
+      device.queue.writeBuffer(uniformBuffers.attnOutput, 12, new Uint32Array([seqLen]));
+
+      // Step 1: Embedding lookup
+      let enc = device.createCommandEncoder();
+      let pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.embeddingLookup);
+      pass.setBindGroup(0, bindGroupCache.embeddingLookup);
+      pass.dispatchWorkgroups(Math.ceil(H / 256));
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      await readBackBuffer(workBuffers.hidden, H * 4, 'GPU Embedding');
+
+      // Layer 0 only
+      const lb = bindGroupCache.layers[0];
+
+      // Step 2: Pre-attention RMS norm
+      enc = device.createCommandEncoder();
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.rmsNorm);
+      pass.setBindGroup(0, lb.attnNorm);
+      pass.dispatchWorkgroups(1);
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      await readBackBuffer(workBuffers.normed, H * 4, 'GPU PreAttnNorm');
+
+      // Step 3: Q projection
+      enc = device.createCommandEncoder();
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.linearQ8);
+      pass.setBindGroup(0, lb.linearQ);
+      pass.dispatchWorkgroups(Math.ceil(Q / 256));
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      await readBackBuffer(workBuffers.q, Q * 4, 'GPU Q proj');
+
+      // Step 4: Q head norm (BEFORE RoPE — Gemma 3 order)
+      enc = device.createCommandEncoder();
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.perHeadRmsNorm);
+      pass.setBindGroup(0, lb.qNorm);
+      pass.dispatchWorkgroups(NQH);
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      await readBackBuffer(workBuffers.q, Q * 4, 'GPU Q after norm');
+
+      // Step 5: RoPE on Q (AFTER norm — Gemma 3 order)
+      enc = device.createCommandEncoder();
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.rope);
+      pass.setBindGroup(0, lb.ropeQ);
+      pass.dispatchWorkgroups(Math.ceil((NQH * HD / 2) / 256));
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      await readBackBuffer(workBuffers.q, Q * 4, 'GPU Q after RoPE');
+
+      // Continue with rest of the layer + remaining layers as normal forward pass
+      // (We just needed layer 0 debug)
+      enc = device.createCommandEncoder();
+
+      // K proj, V proj, K norm, RoPE K, and rest of layer 0
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.linearQ8);
+      pass.setBindGroup(0, lb.linearK);
+      pass.dispatchWorkgroups(Math.ceil(KV / 256));
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.linearQ8);
+      pass.setBindGroup(0, lb.linearV);
+      pass.dispatchWorkgroups(Math.ceil(KV / 256));
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.perHeadRmsNorm);
+      pass.setBindGroup(0, lb.kNorm);
+      pass.dispatchWorkgroups(NKH);
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.rope);
+      pass.setBindGroup(0, lb.ropeK);
+      pass.dispatchWorkgroups(Math.ceil((NKH * HD / 2) / 256));
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.kvCacheStore);
+      pass.setBindGroup(0, lb.kvStore);
+      pass.dispatchWorkgroups(Math.ceil(KV / 256));
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.attnScore);
+      pass.setBindGroup(0, lb.attnScore);
+      pass.dispatchWorkgroups(Math.ceil((NQH * seqLen) / 256));
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.softmax);
+      pass.setBindGroup(0, lb.softmax);
+      pass.dispatchWorkgroups(NQH);
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.attnOutput);
+      pass.setBindGroup(0, lb.attnOutput);
+      pass.dispatchWorkgroups(Math.ceil((NQH * HD) / 256));
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.linearQ8);
+      pass.setBindGroup(0, lb.linearAttnOut);
+      pass.dispatchWorkgroups(Math.ceil(H / 256));
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.rmsNorm);
+      pass.setBindGroup(0, lb.postAttnNorm);
+      pass.dispatchWorkgroups(1);
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.add);
+      pass.setBindGroup(0, lb.residualAdd1);
+      pass.dispatchWorkgroups(Math.ceil(H / 256));
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.rmsNorm);
+      pass.setBindGroup(0, lb.ffnNorm);
+      pass.dispatchWorkgroups(1);
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.linearQ8);
+      pass.setBindGroup(0, lb.ffnGate);
+      pass.dispatchWorkgroups(Math.ceil(CONFIG.intermediate_size / 256));
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.linearQ8);
+      pass.setBindGroup(0, lb.ffnUp);
+      pass.dispatchWorkgroups(Math.ceil(CONFIG.intermediate_size / 256));
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.siluMul);
+      pass.setBindGroup(0, lb.siluMul);
+      pass.dispatchWorkgroups(Math.ceil(CONFIG.intermediate_size / 256));
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.linearQ8);
+      pass.setBindGroup(0, lb.ffnDown);
+      pass.dispatchWorkgroups(Math.ceil(H / 256));
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.rmsNorm);
+      pass.setBindGroup(0, lb.postFfnNorm);
+      pass.dispatchWorkgroups(1);
+      pass.end();
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.add);
+      pass.setBindGroup(0, lb.residualAdd2);
+      pass.dispatchWorkgroups(Math.ceil(H / 256));
+      pass.end();
+
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      await readBackBuffer(workBuffers.hidden, H * 4, 'GPU Hidden after L0');
+
+      // Continue with layers 1-17 using normal forward pass style
+      enc = device.createCommandEncoder();
+      for (let layerIdx = 1; layerIdx < CONFIG.num_layers; layerIdx++) {
+        const lb2 = bindGroupCache.layers[layerIdx];
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb2.attnNorm); pass.dispatchWorkgroups(1); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb2.linearQ); pass.dispatchWorkgroups(Math.ceil(Q / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb2.linearK); pass.dispatchWorkgroups(Math.ceil(KV / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb2.linearV); pass.dispatchWorkgroups(Math.ceil(KV / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.perHeadRmsNorm); pass.setBindGroup(0, lb2.qNorm); pass.dispatchWorkgroups(NQH); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.perHeadRmsNorm); pass.setBindGroup(0, lb2.kNorm); pass.dispatchWorkgroups(NKH); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.rope); pass.setBindGroup(0, lb2.ropeQ); pass.dispatchWorkgroups(Math.ceil((NQH * HD / 2) / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.rope); pass.setBindGroup(0, lb2.ropeK); pass.dispatchWorkgroups(Math.ceil((NKH * HD / 2) / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.kvCacheStore); pass.setBindGroup(0, lb2.kvStore); pass.dispatchWorkgroups(Math.ceil(KV / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.attnScore); pass.setBindGroup(0, lb2.attnScore); pass.dispatchWorkgroups(Math.ceil((NQH * seqLen) / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.softmax); pass.setBindGroup(0, lb2.softmax); pass.dispatchWorkgroups(NQH); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.attnOutput); pass.setBindGroup(0, lb2.attnOutput); pass.dispatchWorkgroups(Math.ceil((NQH * HD) / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb2.linearAttnOut); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb2.postAttnNorm); pass.dispatchWorkgroups(1); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.add); pass.setBindGroup(0, lb2.residualAdd1); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb2.ffnNorm); pass.dispatchWorkgroups(1); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb2.ffnGate); pass.dispatchWorkgroups(Math.ceil(CONFIG.intermediate_size / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb2.ffnUp); pass.dispatchWorkgroups(Math.ceil(CONFIG.intermediate_size / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.siluMul); pass.setBindGroup(0, lb2.siluMul); pass.dispatchWorkgroups(Math.ceil(CONFIG.intermediate_size / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb2.ffnDown); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb2.postFfnNorm); pass.dispatchWorkgroups(1); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.add); pass.setBindGroup(0, lb2.residualAdd2); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+      }
+
+      // Final norm
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.rmsNorm);
+      pass.setBindGroup(0, bindGroupCache.finalNorm);
+      pass.dispatchWorkgroups(1);
+      pass.end();
+
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+    }
+
+    // Debug: read back hidden state
+    async function readBackHidden(label) {
+      const H = CONFIG.hidden_size;
+      const encoder = device.createCommandEncoder();
+      encoder.copyBufferToBuffer(workBuffers.hidden, 0, workBuffers.hiddenReadback, 0, H * 4);
+      device.queue.submit([encoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      await workBuffers.hiddenReadback.mapAsync(GPUMapMode.READ);
+      const data = new Float32Array(workBuffers.hiddenReadback.getMappedRange().slice(0));
+      workBuffers.hiddenReadback.unmap();
+      log(`${label}: [${data.slice(0, 10).map(v => v.toFixed(6)).join(', ')}]`);
+      return data;
+    }
+
+    // Debug: read back logits and return top-K
+    async function getTopKLogits(k = 10) {
+      const V = CONFIG.vocab_size;
+      const encoder = device.createCommandEncoder();
+      encoder.copyBufferToBuffer(workBuffers.logits, 0, workBuffers.logitsReadback, 0, V * 4);
+      device.queue.submit([encoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+
+      await workBuffers.logitsReadback.mapAsync(GPUMapMode.READ);
+      const logits = new Float32Array(workBuffers.logitsReadback.getMappedRange().slice(0));
+      workBuffers.logitsReadback.unmap();
+
+      // Find top-K
+      const indexed = [];
+      for (let i = 0; i < logits.length; i++) indexed.push([i, logits[i]]);
+      indexed.sort((a, b) => b[1] - a[1]);
+
+      const topK = indexed.slice(0, k).map(([id, val]) => ({
+        id, val: val.toFixed(4), token: decodeToken(id)
+      }));
+      return topK;
+    }
+
+    // =========================================================================
+    // Generation
+    // =========================================================================
+    let generating = false;
+
+    async function generate(prompt, maxTokens, temperature = 0.7, topP = 0.9, repPenalty = 1.15) {
+      if (generating) return;
+      generating = true;
+
+      const outputArea = document.getElementById('output-area');
+      const timingEl = document.getElementById('timing');
+      const btn = document.getElementById('generate-btn');
+      btn.disabled = true;
+      btn.textContent = 'Generating...';
+
+      try {
+        // Wrap in Gemma chat template for IT model
+        const chatPrompt = `<start_of_turn>user\n${prompt}<end_of_turn>\n<start_of_turn>model\n`;
+
+        // Encode prompt
+        const encodeStart = performance.now();
+        const inputTokens = encodeSimple(chatPrompt);
+        const encodeTime = performance.now() - encodeStart;
+        log(`\nSampling: temperature=${temperature}, top_p=${topP}${temperature === 0 ? ' (greedy)' : ''}`, 'info');
+        log(`Encoded prompt: "${prompt}" -> ${inputTokens.length} tokens (${encodeTime.toFixed(1)}ms)`, 'info');
+        log(`  (Wrapped in Gemma chat template)`);
+        log(`  Token IDs: [${inputTokens.join(', ')}]`);
+
+        // Show prompt tokens decoded back
+        const promptDecoded = decodeTokens(inputTokens.slice(1)); // skip BOS for display
+        log(`  Decoded back: "${promptDecoded}"`);
+
+        const allTokens = [...inputTokens];
+
+        // Display prompt
+        outputArea.innerHTML = `<span class="prompt-text">${escapeHtml(prompt)}\n</span><span class="generated-text"></span>`;
+
+        setStatus('Prefilling prompt...');
+
+        // Prefill: batch-submit all tokens (no await between them)
+        const prefillStart = performance.now();
+        await prefillBatched(inputTokens);
+        const prefillTime = performance.now() - prefillStart;
+        log(`Prefill: ${inputTokens.length} tokens in ${prefillTime.toFixed(1)}ms (${(inputTokens.length / prefillTime * 1000).toFixed(1)} t/s)`, 'success');
+
+        setStatus('Generating...');
+
+        // Get first generated token using combined forward+lmHead+argmax (single submit)
+        const genStart = performance.now();
+        // For the first gen token, we need LM head on the last prefill hidden state
+        // But prefillBatched already ran the final norm, so we need a forwardPassAndGetToken
+        // that starts fresh. Actually the last prefill token's hidden state IS in the buffer,
+        // but the final norm output (normed) was computed. We need to re-run from the last
+        // prefill token to get the first gen token.
+        // Actually, forwardPassOnly runs the final norm too, so normed buffer has the right state.
+        // We just need LM head + argmax. But for simplicity, let's use a lightweight path:
+        {
+          const encoder = device.createCommandEncoder();
+          let pass;
+          const V = CONFIG.vocab_size;
+          // LM Head (f32 — Q8_0 too lossy for 262K vocab)
+          pass = encoder.beginComputePass();
+          pass.setPipeline(pipelines.lmHead);
+          pass.setBindGroup(0, bindGroupCache.lmHead);
+          pass.dispatchWorkgroups(Math.ceil(V / 256));
+          pass.end();
+
+          const useGreedyFast = (temperature === 0 && repPenalty <= 1.0);
+          if (useGreedyFast) {
+            pass = encoder.beginComputePass();
+            pass.setPipeline(pipelines.argmax);
+            pass.setBindGroup(0, bindGroupCache.argmax);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+            encoder.copyBufferToBuffer(workBuffers.argmaxResult, 0, workBuffers.argmaxReadback, 0, 4);
+            device.queue.submit([encoder.finish()]);
+            await device.queue.onSubmittedWorkDone();
+            await workBuffers.argmaxReadback.mapAsync(GPUMapMode.READ);
+            const r = new Uint32Array(workBuffers.argmaxReadback.getMappedRange());
+            var nextToken = r[0];
+            workBuffers.argmaxReadback.unmap();
+          } else {
+            pass = encoder.beginComputePass();
+            pass.setPipeline(pipelines.topk256);
+            pass.setBindGroup(0, bindGroupCache.topk256);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+            encoder.copyBufferToBuffer(workBuffers.topk256Result, 0, workBuffers.topk256Readback, 0, 256 * 2 * 4);
+            device.queue.submit([encoder.finish()]);
+            await device.queue.onSubmittedWorkDone();
+            await workBuffers.topk256Readback.mapAsync(GPUMapMode.READ);
+            const topkData = new Float32Array(workBuffers.topk256Readback.getMappedRange().slice(0));
+            workBuffers.topk256Readback.unmap();
+            const candidates = new Array(256);
+            const topkU32 = new Uint32Array(topkData.buffer.slice(0));
+            for (let i = 0; i < 256; i++) candidates[i] = { val: topkData[i*2], id: topkU32[i*2+1] };
+            if (repPenalty > 1.0 && allTokens.length > 0) {
+              const seen = new Set(allTokens);
+              for (let i = 0; i < 256; i++) {
+                if (seen.has(candidates[i].id)) {
+                  if (candidates[i].val > 0) candidates[i].val /= repPenalty;
+                  else candidates[i].val *= repPenalty;
+                }
+              }
+            }
+            candidates.sort((a, b) => b.val - a.val);
+            if (temperature === 0) {
+              var nextToken = candidates[0].id;
+            } else {
+              const maxL = candidates[0].val;
+              let se = 0;
+              const pr = new Float32Array(256);
+              for (let i = 0; i < 256; i++) { pr[i] = Math.exp((candidates[i].val - maxL) / temperature); se += pr[i]; }
+              let cp = 0, co = 256;
+              for (let i = 0; i < 256; i++) { cp += pr[i] / se; if (cp >= topP) { co = i + 1; break; } }
+              let ss = 0;
+              for (let i = 0; i < co; i++) ss += pr[i];
+              let rr = Math.random() * ss;
+              var nextToken = candidates[co - 1].id;
+              for (let i = 0; i < co; i++) { rr -= pr[i]; if (rr <= 0) { nextToken = candidates[i].id; break; } }
+            }
+          }
+        }
+
+        allTokens.push(nextToken);
+
+        let generatedTokens = [nextToken];
+        let genTokenCount = 1;
+
+        // Update display
+        const genSpan = outputArea.querySelector('.generated-text');
+        genSpan.textContent = decodeToken(nextToken);
+        timingEl.textContent = `Generated 1 token...`;
+
+        // Auto-regressive generation using combined forward+lmHead+argmax
+        for (let step = 1; step < maxTokens; step++) {
+          if (nextToken === 1) break; // EOS
+          if (nextToken === 0) break; // PAD
+          if (nextToken === 106) break; // <end_of_turn>
+
+          const pos = inputTokens.length + step - 1;
+          if (pos >= CONFIG.context_length - 1) {
+            log('Reached max context length', 'info');
+            break;
+          }
+
+          // Single submit: forward pass + LM head + token selection
+          nextToken = await forwardPassAndGetToken(nextToken, pos, temperature, topP, repPenalty, allTokens);
+
+          if (nextToken === 1) break; // EOS
+          if (nextToken === 0) break; // PAD
+          if (nextToken === 106) break; // <end_of_turn>
+
+          allTokens.push(nextToken);
+          generatedTokens.push(nextToken);
+          genTokenCount++;
+
+          // Incremental display
+          genSpan.textContent = decodeTokens(generatedTokens);
+
+          const elapsed = performance.now() - genStart;
+          const tokPerSec = (genTokenCount / elapsed * 1000).toFixed(1);
+          timingEl.textContent = `Generated ${genTokenCount} tokens | ${tokPerSec} tokens/sec | ${elapsed.toFixed(0)}ms elapsed`;
+          setStatus(`Generating... ${genTokenCount} tokens (${tokPerSec} t/s)`);
+        }
+
+        const totalGenTime = performance.now() - genStart;
+        const finalTokPerSec = (genTokenCount / totalGenTime * 1000).toFixed(1);
+
+        timingEl.textContent = `Prefill: ${inputTokens.length} tokens in ${prefillTime.toFixed(0)}ms (${(inputTokens.length / prefillTime * 1000).toFixed(1)} t/s) | Generation: ${genTokenCount} tokens in ${totalGenTime.toFixed(0)}ms (${finalTokPerSec} t/s)`;
+        setStatus(`Done: ${genTokenCount} tokens generated at ${finalTokPerSec} tokens/sec`);
+        log(`\nGeneration complete: ${genTokenCount} tokens in ${totalGenTime.toFixed(1)}ms (${finalTokPerSec} t/s)`, 'success');
+        log(`Full output: "${decodeTokens(allTokens.slice(1))}"`, 'info');
+
+      } catch (err) {
+        log(`\nGeneration ERROR: ${err.message}`, 'error');
+        log(`Stack: ${err.stack}`, 'error');
+        setStatus(`Error: ${err.message}`);
+      } finally {
+        generating = false;
+        btn.disabled = false;
+        btn.textContent = 'Generate';
+      }
+    }
+
+    function escapeHtml(text) {
+      return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // Make generate accessible from button onclick
+    window.onGenerate = function() {
+      const prompt = document.getElementById('prompt-input').value;
+      const maxTokens = parseInt(document.getElementById('max-tokens').value) || 50;
+      const temperature = parseFloat(document.getElementById('temperature').value) || 0;
+      const topP = parseFloat(document.getElementById('top-p').value) || 0.9;
+      const repPenalty = parseFloat(document.getElementById('rep-penalty').value) || 1.0;
+      resetKVCaches();
+      generate(prompt, maxTokens, temperature, topP, repPenalty);
+    };
+
+    // Debug: embedding-only forward pass
+    async function debugEmbeddingOnly(tokenId) {
+      const H = CONFIG.hidden_size;
+      device.queue.writeBuffer(uniformBuffers.embeddingLookup, 4, new Uint32Array([tokenId]));
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.embeddingLookup);
+      pass.setBindGroup(0, bindGroupCache.embeddingLookup);
+      pass.dispatchWorkgroups(Math.ceil(H / 256));
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      return await readBackBuffer(workBuffers.hidden, H * 4, 'embedding');
+    }
+
+    // Debug: get layer-by-layer hidden states
+    async function debugLayerOutputs(tokenId, position) {
+      const H = CONFIG.hidden_size;
+      device.queue.writeBuffer(uniformBuffers.embeddingLookup, 4, new Uint32Array([tokenId]));
+      const posU32 = new Uint32Array([position]);
+      for (let il = 0; il < CONFIG.num_layers; il++) {
+        device.queue.writeBuffer(uniformBuffers.fusedNormRopeQ[il], 12, posU32);
+        device.queue.writeBuffer(uniformBuffers.fusedNormRopeK[il], 12, posU32);
+      }
+      device.queue.writeBuffer(uniformBuffers.kvCacheStore, 8, posU32);
+      const seqU32 = new Uint32Array([position + 1]);
+      device.queue.writeBuffer(uniformBuffers.attnScore, 12, seqU32);
+      device.queue.writeBuffer(uniformBuffers.softmax, 4, seqU32);
+      device.queue.writeBuffer(uniformBuffers.attnOutput, 12, seqU32);
+
+      // Embedding
+      let enc = device.createCommandEncoder();
+      let pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.embeddingLookup);
+      pass.setBindGroup(0, bindGroupCache.embeddingLookup);
+      pass.dispatchWorkgroups(Math.ceil(H / 256));
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      const embOut = await readBackBuffer(workBuffers.hidden, H * 4, 'emb');
+
+      const results = { embedding: { first5: Array.from(embOut.slice(0,5)).map(v=>v.toFixed(6)), rms: Math.sqrt(Array.from(embOut).reduce((s,v)=>s+v*v,0)/H).toFixed(4) } };
+
+      // Run layer by layer
+      for (let layerIdx = 0; layerIdx < CONFIG.num_layers; layerIdx++) {
+        // Full layer forward (same as forwardPass)
+        const lb = bindGroupCache.layers[layerIdx];
+        enc = device.createCommandEncoder();
+        // attn norm
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb.attnNorm); pass.dispatchWorkgroups(1); pass.end();
+        // Q+K+V
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8);
+        pass.setBindGroup(0, lb.linearQ); pass.dispatchWorkgroups(Math.ceil(CONFIG.q_dim / 256));
+        pass.setBindGroup(0, lb.linearK); pass.dispatchWorkgroups(Math.ceil(CONFIG.kv_dim / 256));
+        pass.setBindGroup(0, lb.linearV); pass.dispatchWorkgroups(Math.ceil(CONFIG.kv_dim / 256));
+        pass.end();
+        // Fused norm+rope
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.fusedPerHeadNormRope);
+        pass.setBindGroup(0, lb.fusedNormRopeQ); pass.dispatchWorkgroups(CONFIG.num_q_heads);
+        pass.setBindGroup(0, lb.fusedNormRopeK); pass.dispatchWorkgroups(CONFIG.num_kv_heads);
+        pass.end();
+        // KV store
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.kvCacheStore); pass.setBindGroup(0, lb.kvStore); pass.dispatchWorkgroups(Math.ceil(CONFIG.kv_dim/256)); pass.end();
+        // Attn
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.attnScore); pass.setBindGroup(0, lb.attnScore); pass.dispatchWorkgroups(Math.ceil((CONFIG.num_q_heads*(position+1))/256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.softmax); pass.setBindGroup(0, lb.softmax); pass.dispatchWorkgroups(CONFIG.num_q_heads); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.attnOutput); pass.setBindGroup(0, lb.attnOutput); pass.dispatchWorkgroups(Math.ceil((CONFIG.num_q_heads*CONFIG.head_dim)/256)); pass.end();
+        // Output proj
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.linearAttnOut); pass.dispatchWorkgroups(Math.ceil(H/256)); pass.end();
+        // Fused post-attn norm + residual
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.fusedNormAdd); pass.setBindGroup(0, lb.fusedPostAttnNormAdd); pass.dispatchWorkgroups(1); pass.end();
+        // FFN
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb.ffnNorm); pass.dispatchWorkgroups(1); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8);
+        pass.setBindGroup(0, lb.ffnGate); pass.dispatchWorkgroups(Math.ceil(CONFIG.intermediate_size/256));
+        pass.setBindGroup(0, lb.ffnUp); pass.dispatchWorkgroups(Math.ceil(CONFIG.intermediate_size/256));
+        pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.siluMul); pass.setBindGroup(0, lb.siluMul); pass.dispatchWorkgroups(Math.ceil(CONFIG.intermediate_size/256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.ffnDown); pass.dispatchWorkgroups(Math.ceil(H/256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.fusedNormAdd); pass.setBindGroup(0, lb.fusedPostFfnNormAdd); pass.dispatchWorkgroups(1); pass.end();
+        device.queue.submit([enc.finish()]);
+        await device.queue.onSubmittedWorkDone();
+
+        const layerOut = await readBackBuffer(workBuffers.hidden, H * 4, `L${layerIdx}`);
+        results[`layer${layerIdx}`] = { first5: Array.from(layerOut.slice(0,5)).map(v=>v.toFixed(6)), rms: Math.sqrt(Array.from(layerOut).reduce((s,v)=>s+v*v,0)/H).toFixed(4) };
+      }
+      return results;
+    }
+
+    // Expose internals for debugging from Chrome console
+    window._debug = {
+      forwardPass, forwardPassAndGetToken, forwardPassOnly, prefillBatched,
+      lmHeadAndArgmax, sampleTopP, getTopKLogits, encodeSimple,
+      resetKVCaches, readBackBuffer, debugForwardPass, debugNaN, debugNaN2, nanDebugForwardPass,
+      debugEmbeddingOnly, debugLayerOutputs,
+      get device() { return device; },
+      get workBuffers() { return workBuffers; },
+      get kvCaches() { return kvCaches; },
+      get CONFIG() { return CONFIG; },
+      decodeToken, decodeTokens,
+    };
+
+    window.onDebugNaN = function() {
+      const prompt = document.getElementById('prompt-input').value;
+      debugNaN2(prompt);
+    };
+
+    function resetKVCaches() {
+      const HD = CONFIG.head_dim;
+      const NKH = CONFIG.num_kv_heads;
+      const MAX_SEQ = CONFIG.context_length;
+      const zeros = new Float32Array(MAX_SEQ * NKH * HD);
+      for (let i = 0; i < CONFIG.num_layers; i++) {
+        device.queue.writeBuffer(kvCaches[i].k, 0, zeros);
+        device.queue.writeBuffer(kvCaches[i].v, 0, zeros);
+      }
+    }
+
+    // =========================================================================
+    // NaN Debug: trace which layer/operation first produces NaN
+    // =========================================================================
+    async function checkBufferForNaN(buffer, numFloats, label) {
+      const rb = device.createBuffer({ size: numFloats * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(buffer, 0, rb, 0, numFloats * 4);
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      await rb.mapAsync(GPUMapMode.READ);
+      const data = new Float32Array(rb.getMappedRange().slice(0));
+      rb.unmap();
+      rb.destroy();
+
+      let nanCount = 0, infCount = 0, maxAbs = 0;
+      for (let i = 0; i < data.length; i++) {
+        if (isNaN(data[i])) nanCount++;
+        else if (!isFinite(data[i])) infCount++;
+        else if (Math.abs(data[i]) > maxAbs) maxAbs = Math.abs(data[i]);
+      }
+      return { nanCount, infCount, maxAbs, data, label };
+    }
+
+    async function nanDebugForwardPass(tokenId, position) {
+      const H = CONFIG.hidden_size;
+      const Q = CONFIG.q_dim;
+      const KV = CONFIG.kv_dim;
+      const I = CONFIG.intermediate_size;
+      const HD = CONFIG.head_dim;
+      const NQH = CONFIG.num_q_heads;
+      const NKH = CONFIG.num_kv_heads;
+      const MAX_SEQ = CONFIG.context_length;
+      const seqLen = position + 1;
+
+      // Update all uniforms
+      device.queue.writeBuffer(uniformBuffers.embeddingLookup, 4, new Uint32Array([tokenId]));
+      const posU32 = new Uint32Array([position]);
+      for (let il = 0; il < CONFIG.num_layers; il++) {
+        device.queue.writeBuffer(uniformBuffers.ropeQ[il], 8, posU32);
+        device.queue.writeBuffer(uniformBuffers.ropeK[il], 8, posU32);
+      }
+      device.queue.writeBuffer(uniformBuffers.kvCacheStore, 8, posU32);
+      const seqU32 = new Uint32Array([seqLen]);
+      device.queue.writeBuffer(uniformBuffers.attnScore, 12, seqU32);
+      device.queue.writeBuffer(uniformBuffers.softmax, 4, seqU32);
+      device.queue.writeBuffer(uniformBuffers.attnOutput, 12, seqU32);
+
+      // Embedding
+      let enc = device.createCommandEncoder();
+      let pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.embeddingLookup);
+      pass.setBindGroup(0, bindGroupCache.embeddingLookup);
+      pass.dispatchWorkgroups(Math.ceil(H / 256));
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+
+      let check = await checkBufferForNaN(workBuffers.hidden, H, 'embedding');
+      if (check.nanCount || check.infCount) {
+        log(`🔴 NaN/Inf in EMBEDDING: NaN=${check.nanCount}, Inf=${check.infCount}`, 'error');
+        return { found: true, where: 'embedding', position, tokenId, check };
+      }
+
+      // Process each layer with NaN checks
+      for (let layerIdx = 0; layerIdx < CONFIG.num_layers; layerIdx++) {
+        const lb = bindGroupCache.layers[layerIdx];
+
+        // Run full layer
+        enc = device.createCommandEncoder();
+        // 1. Pre-attention norm
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb.attnNorm); pass.dispatchWorkgroups(1); pass.end();
+        // 2-4. Q, K, V projections
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.linearQ); pass.dispatchWorkgroups(Math.ceil(Q / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.linearK); pass.dispatchWorkgroups(Math.ceil(KV / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.linearV); pass.dispatchWorkgroups(Math.ceil(KV / 256)); pass.end();
+        // 5-6. Q/K norms
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.perHeadRmsNorm); pass.setBindGroup(0, lb.qNorm); pass.dispatchWorkgroups(NQH); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.perHeadRmsNorm); pass.setBindGroup(0, lb.kNorm); pass.dispatchWorkgroups(NKH); pass.end();
+        // 7-8. RoPE
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.rope); pass.setBindGroup(0, lb.ropeQ); pass.dispatchWorkgroups(Math.ceil((NQH * HD / 2) / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.rope); pass.setBindGroup(0, lb.ropeK); pass.dispatchWorkgroups(Math.ceil((NKH * HD / 2) / 256)); pass.end();
+        // 9. KV cache store
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.kvCacheStore); pass.setBindGroup(0, lb.kvStore); pass.dispatchWorkgroups(Math.ceil(KV / 256)); pass.end();
+        // 10-12. Attention
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.attnScore); pass.setBindGroup(0, lb.attnScore); pass.dispatchWorkgroups(Math.ceil((NQH * seqLen) / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.softmax); pass.setBindGroup(0, lb.softmax); pass.dispatchWorkgroups(NQH); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.attnOutput); pass.setBindGroup(0, lb.attnOutput); pass.dispatchWorkgroups(Math.ceil((NQH * HD) / 256)); pass.end();
+        // 13. Output projection
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.linearAttnOut); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+        // 14. Post-attention norm
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb.postAttnNorm); pass.dispatchWorkgroups(1); pass.end();
+        // 15. Residual add
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.add); pass.setBindGroup(0, lb.residualAdd1); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+        // 16. FFN norm
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb.ffnNorm); pass.dispatchWorkgroups(1); pass.end();
+        // 17-18. FFN gate, up
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.ffnGate); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.ffnUp); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
+        // 19. GeGLU
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.siluMul); pass.setBindGroup(0, lb.siluMul); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
+        // 20. FFN down
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.ffnDown); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+        // 21. Post-FFN norm
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb.postFfnNorm); pass.dispatchWorkgroups(1); pass.end();
+        // 22. Residual add
+        pass = enc.beginComputePass(); pass.setPipeline(pipelines.add); pass.setBindGroup(0, lb.residualAdd2); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+
+        device.queue.submit([enc.finish()]);
+        await device.queue.onSubmittedWorkDone();
+
+        // Check hidden state after this layer
+        check = await checkBufferForNaN(workBuffers.hidden, H, `layer ${layerIdx} hidden`);
+        if (check.nanCount || check.infCount) {
+          log(`🔴 NaN/Inf after LAYER ${layerIdx}: NaN=${check.nanCount}, Inf=${check.infCount}, maxAbs=${check.maxAbs.toExponential(3)}`, 'error');
+
+          // Immediately check ALL intermediate buffers (they still hold this layer's values!)
+          log(`\n🔍 Checking intermediate buffers in-place for layer ${layerIdx}:`, 'info');
+          const intermediates = [
+            ['normed (ffnNorm output)', workBuffers.normed, H],
+            ['q (after RoPE)', workBuffers.q, Q],
+            ['k (after RoPE)', workBuffers.k, KV],
+            ['v (after linearV)', workBuffers.v, KV],
+            ['attnScores (after softmax)', workBuffers.attnScores, NQH * seqLen],
+            ['attnOut', workBuffers.attnOut, NQH * HD],
+            ['attnProj', workBuffers.attnProj, H],
+            ['postAttnNormed', workBuffers.postAttnNormed, H],
+            ['residual (after add1)', workBuffers.residual, H],
+            ['ffnGate', workBuffers.ffnGate, I],
+            ['ffnUp', workBuffers.ffnUp, I],
+            ['ffnMul (after GeGLU)', workBuffers.ffnMul, I],
+            ['ffnDown', workBuffers.ffnDown, H],
+            ['postFfnNormed', workBuffers.postFfnNormed, H],
+            ['hidden (after add2)', workBuffers.hidden, H],
+          ];
+
+          for (const [name, buf, size] of intermediates) {
+            const c = await checkBufferForNaN(buf, size, name);
+            const status = (c.nanCount || c.infCount)
+              ? `🔴 NaN=${c.nanCount}, Inf=${c.infCount}`
+              : `✅ maxAbs=${c.maxAbs.toFixed(4)}`;
+            log(`  ${name}: ${status}  first5=[${Array.from(c.data.slice(0,5)).map(v=> isNaN(v) ? 'NaN' : v.toFixed(4)).join(', ')}]`);
+          }
+
+          // Also check the hidden state that was INPUT to this layer
+          // (it was overwritten by residualAdd2, but we can check what the PREVIOUS layer left)
+          // We can't recover it, but let's check the KV cache for this layer
+          const kvK = await checkBufferForNaN(kvCaches[layerIdx].k, MAX_SEQ * NKH * HD, `layer ${layerIdx} K cache`);
+          const kvV = await checkBufferForNaN(kvCaches[layerIdx].v, MAX_SEQ * NKH * HD, `layer ${layerIdx} V cache`);
+          log(`  KV cache K: NaN=${kvK.nanCount}, Inf=${kvK.infCount}, maxAbs=${kvK.maxAbs.toFixed(4)}`);
+          log(`  KV cache V: NaN=${kvV.nanCount}, Inf=${kvV.infCount}, maxAbs=${kvV.maxAbs.toFixed(4)}`);
+
+          return { found: true, where: `layer${layerIdx}`, position, tokenId, check };
+        }
+        if (layerIdx % 3 === 0 || layerIdx === CONFIG.num_layers - 1) {
+          log(`  Layer ${layerIdx}: OK (maxAbs=${check.maxAbs.toFixed(2)})`, 'success');
+        }
+      }
+
+      // Final norm
+      enc = device.createCommandEncoder();
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.rmsNorm);
+      pass.setBindGroup(0, bindGroupCache.finalNorm);
+      pass.dispatchWorkgroups(1);
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+
+      check = await checkBufferForNaN(workBuffers.normed, H, 'final norm');
+      if (check.nanCount || check.infCount) {
+        log(`🔴 NaN/Inf in FINAL NORM: NaN=${check.nanCount}, Inf=${check.infCount}`, 'error');
+        return { found: true, where: 'final_norm', position, tokenId, check };
+      }
+
+      return { found: false, position, tokenId };
+    }
+
+    // Drill down into a specific layer to find which operation produces NaN
+    async function nanDrillDownLayer(layerIdx, tokenId, position) {
+      const H = CONFIG.hidden_size;
+      const Q = CONFIG.q_dim;
+      const KV = CONFIG.kv_dim;
+      const I = CONFIG.intermediate_size;
+      const HD = CONFIG.head_dim;
+      const NQH = CONFIG.num_q_heads;
+      const NKH = CONFIG.num_kv_heads;
+      const seqLen = position + 1;
+
+      log(`\n🔍 DRILLING DOWN into layer ${layerIdx}...`, 'info');
+
+      // We need to re-run this layer from the hidden state at the start of this layer.
+      // But we've already corrupted it. Instead, let's re-run the full forward from scratch
+      // up to this layer, then step through the operations one by one.
+      // Actually, we can't easily re-run because the KV cache state matters.
+      // Instead, let's just re-run the ENTIRE forward pass but only check the problem layer in detail.
+
+      // Re-run: update uniforms
+      device.queue.writeBuffer(uniformBuffers.embeddingLookup, 4, new Uint32Array([tokenId]));
+      const posU32 = new Uint32Array([position]);
+      for (let il = 0; il < CONFIG.num_layers; il++) {
+        device.queue.writeBuffer(uniformBuffers.ropeQ[il], 8, posU32);
+        device.queue.writeBuffer(uniformBuffers.ropeK[il], 8, posU32);
+      }
+      device.queue.writeBuffer(uniformBuffers.kvCacheStore, 8, posU32);
+      const seqU32 = new Uint32Array([seqLen]);
+      device.queue.writeBuffer(uniformBuffers.attnScore, 12, seqU32);
+      device.queue.writeBuffer(uniformBuffers.softmax, 4, seqU32);
+      device.queue.writeBuffer(uniformBuffers.attnOutput, 12, seqU32);
+
+      // Reset KV caches so we can re-run cleanly
+      resetKVCaches();
+
+      // Re-run all prior positions (full forward for each)
+      log(`  Re-running ${position} prior positions...`);
+      const chatPrompt = `<start_of_turn>user\nExplain how computers work to a 5 year old<end_of_turn>\n<start_of_turn>model\n`;
+      const tokens = encodeSimple(chatPrompt);
+      for (let p = 0; p < position; p++) {
+        await forwardPass(tokens[p], p);
+      }
+      log(`  Prior positions done. Now stepping through position ${position}, layer ${layerIdx}...`);
+
+      // Run embedding for current position
+      device.queue.writeBuffer(uniformBuffers.embeddingLookup, 4, new Uint32Array([tokenId]));
+      for (let il = 0; il < CONFIG.num_layers; il++) {
+        device.queue.writeBuffer(uniformBuffers.ropeQ[il], 8, posU32);
+        device.queue.writeBuffer(uniformBuffers.ropeK[il], 8, posU32);
+      }
+      device.queue.writeBuffer(uniformBuffers.kvCacheStore, 8, posU32);
+      device.queue.writeBuffer(uniformBuffers.attnScore, 12, seqU32);
+      device.queue.writeBuffer(uniformBuffers.softmax, 4, seqU32);
+      device.queue.writeBuffer(uniformBuffers.attnOutput, 12, seqU32);
+
+      let enc = device.createCommandEncoder();
+      let pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.embeddingLookup);
+      pass.setBindGroup(0, bindGroupCache.embeddingLookup);
+      pass.dispatchWorkgroups(Math.ceil(H / 256));
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+
+      // Run layers 0 through layerIdx-1 as a batch
+      if (layerIdx > 0) {
+        enc = device.createCommandEncoder();
+        for (let li = 0; li < layerIdx; li++) {
+          const lb = bindGroupCache.layers[li];
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb.attnNorm); pass.dispatchWorkgroups(1); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.linearQ); pass.dispatchWorkgroups(Math.ceil(Q / 256)); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.linearK); pass.dispatchWorkgroups(Math.ceil(KV / 256)); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.linearV); pass.dispatchWorkgroups(Math.ceil(KV / 256)); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.perHeadRmsNorm); pass.setBindGroup(0, lb.qNorm); pass.dispatchWorkgroups(NQH); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.perHeadRmsNorm); pass.setBindGroup(0, lb.kNorm); pass.dispatchWorkgroups(NKH); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.rope); pass.setBindGroup(0, lb.ropeQ); pass.dispatchWorkgroups(Math.ceil((NQH * HD / 2) / 256)); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.rope); pass.setBindGroup(0, lb.ropeK); pass.dispatchWorkgroups(Math.ceil((NKH * HD / 2) / 256)); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.kvCacheStore); pass.setBindGroup(0, lb.kvStore); pass.dispatchWorkgroups(Math.ceil(KV / 256)); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.attnScore); pass.setBindGroup(0, lb.attnScore); pass.dispatchWorkgroups(Math.ceil((NQH * seqLen) / 256)); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.softmax); pass.setBindGroup(0, lb.softmax); pass.dispatchWorkgroups(NQH); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.attnOutput); pass.setBindGroup(0, lb.attnOutput); pass.dispatchWorkgroups(Math.ceil((NQH * HD) / 256)); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.linearAttnOut); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb.postAttnNorm); pass.dispatchWorkgroups(1); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.add); pass.setBindGroup(0, lb.residualAdd1); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb.ffnNorm); pass.dispatchWorkgroups(1); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.ffnGate); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.ffnUp); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.siluMul); pass.setBindGroup(0, lb.siluMul); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.ffnDown); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.rmsNorm); pass.setBindGroup(0, lb.postFfnNorm); pass.dispatchWorkgroups(1); pass.end();
+          pass = enc.beginComputePass(); pass.setPipeline(pipelines.add); pass.setBindGroup(0, lb.residualAdd2); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+        }
+        device.queue.submit([enc.finish()]);
+        await device.queue.onSubmittedWorkDone();
+        log(`  Layers 0-${layerIdx-1} re-run OK`);
+      }
+
+      // Now step through the problem layer operation by operation
+      const lb = bindGroupCache.layers[layerIdx];
+      const ops = [
+        { name: 'attnNorm', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.rmsNorm); p.setBindGroup(0, lb.attnNorm); p.dispatchWorkgroups(1); p.end(); return e; }, buf: workBuffers.normed, size: H },
+        { name: 'linearQ', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.linearQ8); p.setBindGroup(0, lb.linearQ); p.dispatchWorkgroups(Math.ceil(Q/256)); p.end(); return e; }, buf: workBuffers.q, size: Q },
+        { name: 'linearK', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.linearQ8); p.setBindGroup(0, lb.linearK); p.dispatchWorkgroups(Math.ceil(KV/256)); p.end(); return e; }, buf: workBuffers.k, size: KV },
+        { name: 'linearV', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.linearQ8); p.setBindGroup(0, lb.linearV); p.dispatchWorkgroups(Math.ceil(KV/256)); p.end(); return e; }, buf: workBuffers.v, size: KV },
+        { name: 'qNorm', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.perHeadRmsNorm); p.setBindGroup(0, lb.qNorm); p.dispatchWorkgroups(NQH); p.end(); return e; }, buf: workBuffers.q, size: Q },
+        { name: 'kNorm', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.perHeadRmsNorm); p.setBindGroup(0, lb.kNorm); p.dispatchWorkgroups(NKH); p.end(); return e; }, buf: workBuffers.k, size: KV },
+        { name: 'ropeQ', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.rope); p.setBindGroup(0, lb.ropeQ); p.dispatchWorkgroups(Math.ceil((NQH*HD/2)/256)); p.end(); return e; }, buf: workBuffers.q, size: Q },
+        { name: 'ropeK', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.rope); p.setBindGroup(0, lb.ropeK); p.dispatchWorkgroups(Math.ceil((NKH*HD/2)/256)); p.end(); return e; }, buf: workBuffers.k, size: KV },
+        { name: 'kvStore', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.kvCacheStore); p.setBindGroup(0, lb.kvStore); p.dispatchWorkgroups(Math.ceil(KV/256)); p.end(); return e; }, buf: null, size: 0 },
+        { name: 'attnScore', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.attnScore); p.setBindGroup(0, lb.attnScore); p.dispatchWorkgroups(Math.ceil((NQH*seqLen)/256)); p.end(); return e; }, buf: workBuffers.attnScores, size: NQH * seqLen },
+        { name: 'softmax', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.softmax); p.setBindGroup(0, lb.softmax); p.dispatchWorkgroups(NQH); p.end(); return e; }, buf: workBuffers.attnScores, size: NQH * seqLen },
+        { name: 'attnOutput', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.attnOutput); p.setBindGroup(0, lb.attnOutput); p.dispatchWorkgroups(Math.ceil((NQH*HD)/256)); p.end(); return e; }, buf: workBuffers.attnOut, size: NQH * HD },
+        { name: 'linearAttnOut', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.linearQ8); p.setBindGroup(0, lb.linearAttnOut); p.dispatchWorkgroups(Math.ceil(H/256)); p.end(); return e; }, buf: workBuffers.attnProj, size: H },
+        { name: 'postAttnNorm', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.rmsNorm); p.setBindGroup(0, lb.postAttnNorm); p.dispatchWorkgroups(1); p.end(); return e; }, buf: workBuffers.postAttnNormed, size: H },
+        { name: 'residualAdd1', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.add); p.setBindGroup(0, lb.residualAdd1); p.dispatchWorkgroups(Math.ceil(H/256)); p.end(); return e; }, buf: workBuffers.residual, size: H },
+        { name: 'ffnNorm', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.rmsNorm); p.setBindGroup(0, lb.ffnNorm); p.dispatchWorkgroups(1); p.end(); return e; }, buf: workBuffers.normed, size: H },
+        { name: 'ffnGate', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.linearQ8); p.setBindGroup(0, lb.ffnGate); p.dispatchWorkgroups(Math.ceil(I/256)); p.end(); return e; }, buf: workBuffers.ffnGate, size: I },
+        { name: 'ffnUp', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.linearQ8); p.setBindGroup(0, lb.ffnUp); p.dispatchWorkgroups(Math.ceil(I/256)); p.end(); return e; }, buf: workBuffers.ffnUp, size: I },
+        { name: 'geGLU', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.siluMul); p.setBindGroup(0, lb.siluMul); p.dispatchWorkgroups(Math.ceil(I/256)); p.end(); return e; }, buf: workBuffers.ffnMul, size: I },
+        { name: 'ffnDown', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.linearQ8); p.setBindGroup(0, lb.ffnDown); p.dispatchWorkgroups(Math.ceil(H/256)); p.end(); return e; }, buf: workBuffers.ffnDown, size: H },
+        { name: 'postFfnNorm', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.rmsNorm); p.setBindGroup(0, lb.postFfnNorm); p.dispatchWorkgroups(1); p.end(); return e; }, buf: workBuffers.postFfnNormed, size: H },
+        { name: 'residualAdd2', fn: () => { const e=device.createCommandEncoder(); const p=e.beginComputePass(); p.setPipeline(pipelines.add); p.setBindGroup(0, lb.residualAdd2); p.dispatchWorkgroups(Math.ceil(H/256)); p.end(); return e; }, buf: workBuffers.hidden, size: H },
+      ];
+
+      for (const op of ops) {
+        const encoder = op.fn();
+        device.queue.submit([encoder.finish()]);
+        await device.queue.onSubmittedWorkDone();
+
+        if (op.buf && op.size > 0) {
+          const check = await checkBufferForNaN(op.buf, op.size, op.name);
+          const status = (check.nanCount || check.infCount)
+            ? `🔴 NaN=${check.nanCount}, Inf=${check.infCount}`
+            : `✅ maxAbs=${check.maxAbs.toFixed(4)}`;
+          log(`  L${layerIdx}.${op.name}: ${status}  first5=[${Array.from(check.data.slice(0,5)).map(v=>v.toFixed(4)).join(', ')}]`);
+
+          if (check.nanCount || check.infCount) {
+            return { found: true, where: `layer${layerIdx}.${op.name}`, position, tokenId, check };
+          }
+        } else {
+          log(`  L${layerIdx}.${op.name}: (no output to check)`);
+        }
+      }
+
+      return { found: true, where: `layer${layerIdx} (NaN disappeared on re-run - may be nondeterministic)`, position, tokenId };
+    }
+
+    // Focused NaN debug: run positions 0-9 normally, then step through position 10
+    async function debugNaN2(prompt) {
+      if (generating) return;
+      generating = true;
+      const btn = document.getElementById('generate-btn');
+      btn.disabled = true;
+
+      try {
+        log('\n🔍 === NaN DEBUG v2 (step-by-step) ===', 'info');
+        resetKVCaches();
+
+        const chatPrompt = `<start_of_turn>user\n${prompt}<end_of_turn>\n<start_of_turn>model\n`;
+        const inputTokens = encodeSimple(chatPrompt);
+        log(`Prompt: "${prompt}" → ${inputTokens.length} tokens`, 'info');
+        log(`Tokens: [${inputTokens.join(', ')}]`);
+        for (let i = 0; i < inputTokens.length; i++) {
+          log(`  pos ${i}: token ${inputTokens[i]} = "${decodeToken(inputTokens[i])}"`);
+        }
+
+        const H = CONFIG.hidden_size;
+        const Q = CONFIG.q_dim;
+        const KV = CONFIG.kv_dim;
+        const I = CONFIG.intermediate_size;
+        const HD = CONFIG.head_dim;
+        const NQH = CONFIG.num_q_heads;
+        const NKH = CONFIG.num_kv_heads;
+        const MAX_SEQ = CONFIG.context_length;
+
+        // First, let's check KV cache state after each position using NORMAL forward pass
+        for (let p = 0; p < inputTokens.length; p++) {
+          await forwardPass(inputTokens[p], p);
+
+          // Quick NaN check on hidden after each position
+          const hCheck = await checkBufferForNaN(workBuffers.hidden, H, `pos ${p} hidden`);
+
+          // Check layer 0 KV cache has data
+          const kvCheck = await checkBufferForNaN(kvCaches[0].k, NKH * HD, `pos ${p} L0 K[0]`);
+
+          if (hCheck.nanCount || hCheck.infCount) {
+            log(`🔴 Position ${p}: NaN in hidden! NaN=${hCheck.nanCount}, Inf=${hCheck.infCount}`, 'error');
+
+            // Check what's in the intermediate buffers RIGHT NOW
+            log(`\n🔍 Intermediate buffer state after position ${p}:`, 'info');
+            const checks = [
+              ['normed', workBuffers.normed, H],
+              ['q', workBuffers.q, Q],
+              ['k', workBuffers.k, KV],
+              ['v', workBuffers.v, KV],
+              ['attnScores', workBuffers.attnScores, NQH * (p+1)],
+              ['attnOut', workBuffers.attnOut, NQH * HD],
+              ['attnProj', workBuffers.attnProj, H],
+              ['postAttnNormed', workBuffers.postAttnNormed, H],
+              ['residual', workBuffers.residual, H],
+              ['ffnGate', workBuffers.ffnGate, I],
+              ['ffnUp', workBuffers.ffnUp, I],
+              ['ffnMul', workBuffers.ffnMul, I],
+              ['ffnDown', workBuffers.ffnDown, H],
+              ['postFfnNormed', workBuffers.postFfnNormed, H],
+            ];
+            for (const [name, buf, size] of checks) {
+              const c = await checkBufferForNaN(buf, size, name);
+              const s = (c.nanCount || c.infCount) ? `🔴 NaN=${c.nanCount} Inf=${c.infCount}` : `✅ maxAbs=${c.maxAbs.toFixed(4)}`;
+              log(`  ${name}: ${s}  [${Array.from(c.data.slice(0,5)).map(v=>isNaN(v)?'NaN':v.toFixed(4)).join(',')}]`);
+            }
+
+            // Check all KV caches
+            for (let li = 0; li < 3; li++) {
+              const ck = await checkBufferForNaN(kvCaches[li].k, MAX_SEQ * NKH * HD, `L${li} K cache`);
+              const cv = await checkBufferForNaN(kvCaches[li].v, MAX_SEQ * NKH * HD, `L${li} V cache`);
+              log(`  L${li} K cache: maxAbs=${ck.maxAbs.toFixed(4)}, NaN=${ck.nanCount}`);
+              log(`  L${li} V cache: maxAbs=${cv.maxAbs.toFixed(4)}, NaN=${cv.nanCount}`);
+            }
+
+            // NOW: re-run this position step by step through each layer
+            log(`\n🔬 RE-RUN position ${p} step by step:`, 'info');
+            resetKVCaches();
+            // Re-run prior positions
+            for (let pp = 0; pp < p; pp++) {
+              await forwardPass(inputTokens[pp], pp);
+            }
+
+            // Verify KV cache has data from prior positions
+            const kvVerify = await checkBufferForNaN(kvCaches[0].k, (p) * NKH * HD, `L0 K cache after ${p} positions`);
+            log(`  L0 K cache (first ${p} positions): maxAbs=${kvVerify.maxAbs.toFixed(4)}`);
+
+            // Now run position p embedding
+            const tokenId = inputTokens[p];
+            const position = p;
+            const seqLen = p + 1;
+
+            // Update uniforms
+            device.queue.writeBuffer(uniformBuffers.embeddingLookup, 4, new Uint32Array([tokenId]));
+            const posU32 = new Uint32Array([position]);
+            for (let il = 0; il < CONFIG.num_layers; il++) {
+              device.queue.writeBuffer(uniformBuffers.ropeQ[il], 8, posU32);
+              device.queue.writeBuffer(uniformBuffers.ropeK[il], 8, posU32);
+            }
+            device.queue.writeBuffer(uniformBuffers.kvCacheStore, 8, posU32);
+            device.queue.writeBuffer(uniformBuffers.attnScore, 12, new Uint32Array([seqLen]));
+            device.queue.writeBuffer(uniformBuffers.softmax, 4, new Uint32Array([seqLen]));
+            device.queue.writeBuffer(uniformBuffers.attnOutput, 12, new Uint32Array([seqLen]));
+
+            // Embedding
+            let enc = device.createCommandEncoder();
+            let pass = enc.beginComputePass();
+            pass.setPipeline(pipelines.embeddingLookup);
+            pass.setBindGroup(0, bindGroupCache.embeddingLookup);
+            pass.dispatchWorkgroups(Math.ceil(H / 256));
+            pass.end();
+            device.queue.submit([enc.finish()]);
+            await device.queue.onSubmittedWorkDone();
+
+            let embCheck = await checkBufferForNaN(workBuffers.hidden, H, 'embedding');
+            log(`  Embedding: maxAbs=${embCheck.maxAbs.toFixed(4)} [${Array.from(embCheck.data.slice(0,5)).map(v=>v.toFixed(4)).join(',')}]`);
+
+            // Step through ALL layers, one op at a time
+            for (let li = 0; li < CONFIG.num_layers; li++) {
+              const lb = bindGroupCache.layers[li];
+
+              const runOp = async (name, fn, buf, size) => {
+                const e = device.createCommandEncoder();
+                fn(e);
+                device.queue.submit([e.finish()]);
+                await device.queue.onSubmittedWorkDone();
+                if (buf && size > 0) {
+                  const c = await checkBufferForNaN(buf, size, name);
+                  const hasNaN = c.nanCount > 0 || c.infCount > 0;
+                  if (hasNaN || li < 2) { // always show first 2 layers
+                    const s = hasNaN ? `🔴 NaN=${c.nanCount} Inf=${c.infCount}` : `✅ maxAbs=${c.maxAbs.toFixed(4)}`;
+                    log(`  L${li}.${name}: ${s} [${Array.from(c.data.slice(0,3)).map(v=>isNaN(v)?'NaN':v.toFixed(4)).join(',')}]`);
+                  }
+                  if (hasNaN) return true;
+                }
+                return false;
+              };
+
+              let nan = false;
+              nan = nan || await runOp('attnNorm', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.rmsNorm); p.setBindGroup(0, lb.attnNorm); p.dispatchWorkgroups(1); p.end(); }, workBuffers.normed, H);
+              nan = nan || await runOp('linearQ', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.linearQ8); p.setBindGroup(0, lb.linearQ); p.dispatchWorkgroups(Math.ceil(Q/256)); p.end(); }, workBuffers.q, Q);
+              nan = nan || await runOp('linearK', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.linearQ8); p.setBindGroup(0, lb.linearK); p.dispatchWorkgroups(Math.ceil(KV/256)); p.end(); }, workBuffers.k, KV);
+              nan = nan || await runOp('linearV', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.linearQ8); p.setBindGroup(0, lb.linearV); p.dispatchWorkgroups(Math.ceil(KV/256)); p.end(); }, workBuffers.v, KV);
+              nan = nan || await runOp('qNorm', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.perHeadRmsNorm); p.setBindGroup(0, lb.qNorm); p.dispatchWorkgroups(NQH); p.end(); }, workBuffers.q, Q);
+              nan = nan || await runOp('kNorm', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.perHeadRmsNorm); p.setBindGroup(0, lb.kNorm); p.dispatchWorkgroups(NKH); p.end(); }, workBuffers.k, KV);
+              nan = nan || await runOp('ropeQ', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.rope); p.setBindGroup(0, lb.ropeQ); p.dispatchWorkgroups(Math.ceil((NQH*HD/2)/256)); p.end(); }, workBuffers.q, Q);
+              nan = nan || await runOp('ropeK', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.rope); p.setBindGroup(0, lb.ropeK); p.dispatchWorkgroups(Math.ceil((NKH*HD/2)/256)); p.end(); }, workBuffers.k, KV);
+              nan = nan || await runOp('kvStore', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.kvCacheStore); p.setBindGroup(0, lb.kvStore); p.dispatchWorkgroups(Math.ceil(KV/256)); p.end(); }, null, 0);
+              nan = nan || await runOp('attnScore', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.attnScore); p.setBindGroup(0, lb.attnScore); p.dispatchWorkgroups(Math.ceil((NQH*seqLen)/256)); p.end(); }, workBuffers.attnScores, NQH * seqLen);
+              nan = nan || await runOp('softmax', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.softmax); p.setBindGroup(0, lb.softmax); p.dispatchWorkgroups(NQH); p.end(); }, workBuffers.attnScores, NQH * seqLen);
+              nan = nan || await runOp('attnOutput', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.attnOutput); p.setBindGroup(0, lb.attnOutput); p.dispatchWorkgroups(Math.ceil((NQH*HD)/256)); p.end(); }, workBuffers.attnOut, NQH * HD);
+              nan = nan || await runOp('linearAttnOut', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.linearQ8); p.setBindGroup(0, lb.linearAttnOut); p.dispatchWorkgroups(Math.ceil(H/256)); p.end(); }, workBuffers.attnProj, H);
+              nan = nan || await runOp('postAttnNorm', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.rmsNorm); p.setBindGroup(0, lb.postAttnNorm); p.dispatchWorkgroups(1); p.end(); }, workBuffers.postAttnNormed, H);
+              nan = nan || await runOp('residualAdd1', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.add); p.setBindGroup(0, lb.residualAdd1); p.dispatchWorkgroups(Math.ceil(H/256)); p.end(); }, workBuffers.residual, H);
+              nan = nan || await runOp('ffnNorm', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.rmsNorm); p.setBindGroup(0, lb.ffnNorm); p.dispatchWorkgroups(1); p.end(); }, workBuffers.normed, H);
+              nan = nan || await runOp('ffnGate', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.linearQ8); p.setBindGroup(0, lb.ffnGate); p.dispatchWorkgroups(Math.ceil(I/256)); p.end(); }, workBuffers.ffnGate, I);
+              nan = nan || await runOp('ffnUp', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.linearQ8); p.setBindGroup(0, lb.ffnUp); p.dispatchWorkgroups(Math.ceil(I/256)); p.end(); }, workBuffers.ffnUp, I);
+              nan = nan || await runOp('geGLU', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.siluMul); p.setBindGroup(0, lb.siluMul); p.dispatchWorkgroups(Math.ceil(I/256)); p.end(); }, workBuffers.ffnMul, I);
+              nan = nan || await runOp('ffnDown', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.linearQ8); p.setBindGroup(0, lb.ffnDown); p.dispatchWorkgroups(Math.ceil(H/256)); p.end(); }, workBuffers.ffnDown, H);
+              nan = nan || await runOp('postFfnNorm', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.rmsNorm); p.setBindGroup(0, lb.postFfnNorm); p.dispatchWorkgroups(1); p.end(); }, workBuffers.postFfnNormed, H);
+              nan = nan || await runOp('residualAdd2', e => { const p=e.beginComputePass(); p.setPipeline(pipelines.add); p.setBindGroup(0, lb.residualAdd2); p.dispatchWorkgroups(Math.ceil(H/256)); p.end(); }, workBuffers.hidden, H);
+
+              if (nan) {
+                log(`💥 NaN at position ${p}, layer ${li}`, 'error');
+                setStatus(`NaN found at position ${p}, layer ${li}`);
+                return;
+              }
+
+              // Brief layer summary
+              const lCheck = await checkBufferForNaN(workBuffers.hidden, H, `L${li}`);
+              if (li % 6 === 0 || li === CONFIG.num_layers - 1) {
+                log(`  Layer ${li} done: maxAbs=${lCheck.maxAbs.toFixed(2)}`);
+              }
+            }
+
+            log(`  Position ${p} completed without NaN on re-run (non-deterministic!)`, 'info');
+            setStatus(`NaN was non-deterministic at position ${p}`);
+            return;
+          }
+
+          // Brief summary for positions that work
+          log(`  Position ${p} (token ${inputTokens[p]} "${decodeToken(inputTokens[p])}"): maxAbs=${hCheck.maxAbs.toFixed(2)}, L0_K0_max=${kvCheck.maxAbs.toFixed(4)}`);
+        }
+
+        log('\n✅ No NaN found during entire prefill!', 'success');
+        setStatus('No NaN found');
+
+      } catch (err) {
+        log(`ERROR: ${err.message}\n${err.stack}`, 'error');
+      } finally {
+        generating = false;
+        btn.disabled = false;
+      }
+    }
+
+    // Run NaN debug on a specific prompt
+    async function debugNaN(prompt) {
+      if (generating) return;
+      generating = true;
+      const btn = document.getElementById('generate-btn');
+      btn.disabled = true;
+
+      try {
+        log('\n🔍 === NaN DEBUG MODE ===', 'info');
+        resetKVCaches();
+
+        const chatPrompt = `<start_of_turn>user\n${prompt}<end_of_turn>\n<start_of_turn>model\n`;
+        const inputTokens = encodeSimple(chatPrompt);
+        log(`Prompt: "${prompt}"`, 'info');
+        log(`Tokens: [${inputTokens.join(', ')}] (${inputTokens.length} tokens)`, 'info');
+        log(`Decoded: "${decodeTokens(inputTokens.slice(1))}"`, 'info');
+
+        setStatus('NaN Debug: running prefill with per-layer checks...');
+
+        // Process each prefill token with NaN checks
+        for (let i = 0; i < inputTokens.length; i++) {
+          log(`\n--- Position ${i}: token ${inputTokens[i]} ("${decodeToken(inputTokens[i])}") ---`, 'info');
+          const result = await nanDebugForwardPass(inputTokens[i], i);
+          if (result.found) {
+            log(`\n💥 FIRST NaN at position ${i}, ${result.where}`, 'error');
+            log(`Token: ${inputTokens[i]} ("${decodeToken(inputTokens[i])}")`, 'error');
+            setStatus(`NaN found at position ${i}, ${result.where}`);
+            return;
+          }
+        }
+
+        // Also check first generation step
+        log(`\n--- Generation step 0 ---`, 'info');
+        const genResult = await nanDebugForwardPass(inputTokens[inputTokens.length - 1], inputTokens.length - 1);
+        if (genResult.found) {
+          log(`\n💥 NaN in generation step: ${genResult.where}`, 'error');
+        } else {
+          log('\n✅ No NaN found during prefill! Checking logits...', 'success');
+          // Check LM head
+          const lmEnc = device.createCommandEncoder();
+          const lmPass = lmEnc.beginComputePass();
+          lmPass.setPipeline(pipelines.lmHead);
+          lmPass.setBindGroup(0, bindGroupCache.lmHead);
+          lmPass.dispatchWorkgroups(Math.ceil(CONFIG.vocab_size / 256));
+          lmPass.end();
+          device.queue.submit([lmEnc.finish()]);
+          await device.queue.onSubmittedWorkDone();
+
+          const logitCheck = await checkBufferForNaN(workBuffers.logits, CONFIG.vocab_size, 'logits');
+          if (logitCheck.nanCount || logitCheck.infCount) {
+            log(`🔴 NaN/Inf in LOGITS: NaN=${logitCheck.nanCount}, Inf=${logitCheck.infCount}`, 'error');
+          } else {
+            log(`✅ Logits OK (maxAbs=${logitCheck.maxAbs.toFixed(2)})`, 'success');
+          }
+        }
+
+        setStatus('NaN debug complete - check log');
+
+      } catch (err) {
+        log(`ERROR: ${err.message}\n${err.stack}`, 'error');
+      } finally {
+        generating = false;
+        btn.disabled = false;
+      }
+    }
+
+    // =========================================================================
+    // Main
+    // =========================================================================
+    async function main() {
+      try {
+        log('=== Gemma 3 270M - Text Generation ===\n', 'info');
+
+        setStatus('Initializing WebGPU...');
+        await initWebGPU();
+
+        setStatus('Loading GGUF file (291MB)...');
+        const HF_BASE = 'https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/';
+        const defaultModel = HF_BASE + 'gemma-3-270m-it-Q8_0.gguf';
+        const modelFile = new URLSearchParams(window.location.search).get('model') || defaultModel;
+        log(`Loading model: ${modelFile}`, 'info');
+
+        // Fetch with progress tracking
+        const response = await fetch(modelFile);
+        const contentLength = response.headers.get('content-length');
+        const total = contentLength ? parseInt(contentLength) : 291543744;
+        const reader = response.body.getReader();
+        const chunks = [];
+        let received = 0;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          received += value.length;
+          const pct = ((received / total) * 100).toFixed(0);
+          const mb = (received / 1e6).toFixed(0);
+          setStatus(`Downloading model... ${mb}MB / ${(total / 1e6).toFixed(0)}MB (${pct}%)`);
+        }
+
+        // Combine chunks into single ArrayBuffer
+        const buffer = new Uint8Array(received);
+        let offset = 0;
+        for (const chunk of chunks) {
+          buffer.set(chunk, offset);
+          offset += chunk.length;
+        }
+        log(`Loaded GGUF: ${(received / 1e6).toFixed(1)}MB`);
+
+        setStatus('Parsing GGUF...');
+        parser = new GGUFParser(buffer);
+        gguf = parser.parse();
+        log(`Parsed ${gguf.tensors.length} tensors`);
+
+        // Extract tokenizer
+        setStatus('Extracting tokenizer...');
+        extractTokenizer();
+
+        setStatus('Creating pipelines...');
+        createPipelines();
+
+        setStatus('Creating uniform buffers...');
+        createUniformBuffers();
+
+        setStatus('Uploading weights to GPU...');
+        uploadWeightsToGPU();
+
+        setStatus('Creating work buffers + KV caches...');
+        createWorkBuffers();
+
+        setStatus('Pre-creating bind groups...');
+        createBindGroups();
+
+        log('\nModel loaded! Ready to generate.', 'success');
+        setStatus('Ready - enter a prompt and click Generate');
+
+        // Enable UI
+        document.getElementById('prompt-input').disabled = false;
+        document.getElementById('generate-btn').disabled = false;
+        document.getElementById('debug-btn').disabled = false;
+
+        // Allow Enter key to trigger generation
+        document.getElementById('prompt-input').addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' && !generating) {
+            window.onGenerate();
+          }
+        });
+
+      } catch (err) {
+        log(`\nERROR: ${err.message}`, 'error');
+        log(`Stack: ${err.stack}`, 'error');
+        console.error(err);
+        setStatus(`FAILED: ${err.message}`);
+        document.title = `FAILED: ${err.message}`;
+      }
+    }
+
+    main();
+  </script>
+</body>
+</html>
