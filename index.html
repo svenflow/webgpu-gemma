@@ -53,7 +53,7 @@
     <label>Max tokens: <input type="number" id="max-tokens" value="2048" min="1" max="2048"></label>
     <label>Temperature: <input type="number" id="temperature" value="0.0" min="0" max="2" step="0.1" style="width:60px;padding:5px;font-family:monospace;background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:3px;"></label>
     <label>Top-p: <input type="number" id="top-p" value="0.9" min="0" max="1" step="0.05" style="width:60px;padding:5px;font-family:monospace;background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:3px;"></label>
-    <label>Rep. penalty: <input type="number" id="rep-penalty" value="1.0" min="1" max="2" step="0.05" style="width:60px;padding:5px;font-family:monospace;background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:3px;"></label>
+    <label>Rep. penalty: <input type="number" id="rep-penalty" value="1.2" min="1" max="2" step="0.05" style="width:60px;padding:5px;font-family:monospace;background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:3px;"></label>
   </div>
   <div id="tools-area" style="margin:10px 0;padding:10px;background:#333;border-radius:5px;">
     <label style="color:#aaa;">Tools (JSON function declarations):</label>
@@ -1320,7 +1320,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         declarations += `}<end_function_declaration>`;
       }
 
-      return `<start_of_turn>developer\nYou are a model that can do function calling with the following functions${declarations}<end_of_turn>\n<start_of_turn>user\n${userQuery}<end_of_turn>\n<start_of_turn>model\n`;
+      return `<start_of_turn>developer\nYou are a model that can do function calling with the following functions\n${declarations}\n<end_of_turn>\n<start_of_turn>user\n${userQuery}<end_of_turn>\n<start_of_turn>model\n`;
     }
 
     function encodeSegment(text, addPrefix = true) {
