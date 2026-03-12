@@ -289,11 +289,12 @@
     // Shaders
     // =========================================================================
     const SHADERS = {
-      // Gather a single column from transposed embedding [V, H]
+      // Q8_0 embedding lookup: dequantize one row from packed Q8_0 embedding
       // Gemma scales embeddings by sqrt(hidden_size) before transformer layers
+      // Q8_0 packed format: 9 u32 per 32-element block (u32[0]=f32 scale, u32[1..8]=packed int8s)
       embeddingLookup: `
 struct Params { hidden_size: u32, token_id: u32 }
-@group(0) @binding(0) var<storage, read> embedding: array<f32>;
+@group(0) @binding(0) var<storage, read> embedding_q8: array<u32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
 @group(0) @binding(2) var<uniform> params: Params;
 
@@ -301,7 +302,22 @@ struct Params { hidden_size: u32, token_id: u32 }
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= params.hidden_size) { return; }
-  output[i] = embedding[params.token_id * params.hidden_size + i] * sqrt(f32(params.hidden_size));
+
+  let blocks_per_row = params.hidden_size / 32u;
+  let row_offset = params.token_id * blocks_per_row * 9u;
+
+  let block_idx = i / 32u;
+  let elem_in_block = i % 32u;
+
+  let block_off = row_offset + block_idx * 9u;
+  let scale = bitcast<f32>(embedding_q8[block_off]);
+
+  let packed_idx = elem_in_block / 4u;
+  let byte_idx = elem_in_block % 4u;
+  let packed = embedding_q8[block_off + 1u + packed_idx];
+  let q = f32(extractBits(bitcast<i32>(packed), byte_idx * 8u, 8u));
+
+  output[i] = q * scale * sqrt(f32(params.hidden_size));
 }`,
 
       rmsNorm: `
@@ -1313,31 +1329,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
       const dataOffset = gguf.dataOffset;
 
       modelBuffers = {
-        embedding: null,
+        embeddingQ8: null,
         layers: [],
         finalNorm: null,
       };
 
       // Embedding is already [V, H] in GGUF (262144 rows of 640 elements)
-      // GGUF ne=[640, 262144] means ne[0]=inner=640, ne[1]=outer=262144
-      // No transpose needed!
+      // Q8_0 packed format used for BOTH token lookup and LM head (saves 671MB vs f32)
       const embedTensor = tensors.find(t => t.name === 'token_embd.weight');
       if (embedTensor) {
-        const rawData = parser.getTensorData(embedTensor, dataOffset);
         const H = CONFIG.hidden_size;
         const V = CONFIG.vocab_size;
 
         log(`  Embedding [${V}, ${H}] - already in correct layout, no transpose needed`);
 
-        // F32 embedding for token lookup
-        modelBuffers.embedding = device.createBuffer({
-          size: rawData.byteLength,
-          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-        });
-        device.queue.writeBuffer(modelBuffers.embedding, 0, rawData);
-        log(`  Loaded embedding (f32 for lookup): ${(rawData.byteLength / 1e6).toFixed(1)}MB`);
-
-        // Q8_0 packed embedding for LM head (only for Q8_0 models)
         if (embedTensor.type === 8) {  // Q8_0
           const packedEmbedding = parser.getTensorDataQ8Packed(embedTensor, dataOffset);
           modelBuffers.embeddingQ8 = device.createBuffer({
@@ -1345,9 +1350,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
           });
           device.queue.writeBuffer(modelBuffers.embeddingQ8, 0, packedEmbedding);
-          log(`  Loaded embedding (Q8_0 packed for LM head): ${(packedEmbedding.byteLength / 1e6).toFixed(1)}MB`);
+          log(`  Loaded Q8_0 packed embedding (shared for lookup + LM head): ${(packedEmbedding.byteLength / 1e6).toFixed(1)}MB`);
         } else {
-          log(`  Skipping Q8_0 packed embedding (using f32 for LM head — tensor type=${embedTensor.type})`);
+          // F16 or F32 model — dequantize to f32 for lookup, no Q8 LM head
+          const rawData = parser.getTensorData(embedTensor, dataOffset);
+          modelBuffers.embeddingQ8 = device.createBuffer({
+            size: rawData.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+          });
+          device.queue.writeBuffer(modelBuffers.embeddingQ8, 0, rawData);
+          log(`  Loaded f32 embedding: ${(rawData.byteLength / 1e6).toFixed(1)}MB`);
         }
       }
 
@@ -1491,11 +1503,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         layers: [],
       };
 
-      // Embedding lookup bind group
+      // Embedding lookup bind group (uses Q8_0 packed embedding)
       bindGroupCache.embeddingLookup = device.createBindGroup({
         layout: pipelines.embeddingLookup.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: { buffer: modelBuffers.embedding } },
+          { binding: 0, resource: { buffer: modelBuffers.embeddingQ8 } },
           { binding: 1, resource: { buffer: workBuffers.hidden } },
           { binding: 2, resource: { buffer: uniformBuffers.embeddingLookup } },
         ],
@@ -1512,19 +1524,17 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         ],
       });
 
-      // LM Head bind group — f32 version (more precise for final logit computation)
+      // LM Head bind group — uses Q8_0 packed embedding via linearQ8 pipeline
+      // (saves 671MB by not needing separate f32 embedding)
       bindGroupCache.lmHead = device.createBindGroup({
-        layout: pipelines.lmHead.getBindGroupLayout(0),
+        layout: pipelines.linearQ8.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: { buffer: workBuffers.normed } },
-          { binding: 1, resource: { buffer: modelBuffers.embedding } },
+          { binding: 1, resource: { buffer: modelBuffers.embeddingQ8 } },
           { binding: 2, resource: { buffer: workBuffers.logits } },
-          { binding: 3, resource: { buffer: uniformBuffers.linearQ8_V_H } }, // params: {V, H}
+          { binding: 3, resource: { buffer: uniformBuffers.linearQ8_V_H } },
         ],
       });
-
-      // NOTE: lmHeadQ8 bind group removed — was unused, and Q8_0 packed embedding
-      // is incompatible with linearF32 layout. LM head uses f32 pipeline above.
 
       // Argmax bind group
       bindGroupCache.argmax = device.createBindGroup({
@@ -2167,7 +2177,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
       // --- LM Head (f32 — Q8_0 is too lossy for 262K vocab, causes wrong token selection) ---
       pass = encoder.beginComputePass();
-      pass.setPipeline(pipelines.lmHead);
+      pass.setPipeline(pipelines.linearQ8);
       pass.setBindGroup(0, bindGroupCache.lmHead);
       pass.dispatchWorkgroups(Math.ceil(V / 256));
       pass.end();
@@ -2436,7 +2446,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
       // LM Head (f32): normed [H] -> logits [V] via f32 embedding
       {
         const pass = encoder.beginComputePass();
-        pass.setPipeline(pipelines.lmHead);
+        pass.setPipeline(pipelines.linearQ8);
         pass.setBindGroup(0, bindGroupCache.lmHead);
         pass.dispatchWorkgroups(Math.ceil(V / 256));
         pass.end();
@@ -2889,7 +2899,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
           const V = CONFIG.vocab_size;
           // LM Head (f32 — Q8_0 too lossy for 262K vocab)
           pass = encoder.beginComputePass();
-          pass.setPipeline(pipelines.lmHead);
+          pass.setPipeline(pipelines.linearQ8);
           pass.setBindGroup(0, bindGroupCache.lmHead);
           pass.dispatchWorkgroups(Math.ceil(V / 256));
           pass.end();
@@ -3703,7 +3713,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
           // Check LM head
           const lmEnc = device.createCommandEncoder();
           const lmPass = lmEnc.beginComputePass();
-          lmPass.setPipeline(pipelines.lmHead);
+          lmPass.setPipeline(pipelines.linearQ8);
           lmPass.setBindGroup(0, bindGroupCache.lmHead);
           lmPass.dispatchWorkgroups(Math.ceil(CONFIG.vocab_size / 256));
           lmPass.end();
@@ -3788,6 +3798,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
         setStatus('Uploading weights to GPU...');
         uploadWeightsToGPU();
+
+        // Free download buffer and parser to reduce memory pressure
+        // (weights are now on GPU, we don't need the CPU-side data anymore)
+        parser = null;
+        gguf = null;
 
         setStatus('Creating work buffers + KV caches...');
         createWorkBuffers();
