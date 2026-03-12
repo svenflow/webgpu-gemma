@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>WebGPU Gemma 3 — 270M Inference at 100 t/s</title>
+  <title>WebGPU FunctionGemma — 270M Function Calling at 100 t/s</title>
   <style>
     body { font-family: monospace; padding: 20px; background: #1a1a1a; color: #fff; max-width: 1200px; margin: 0 auto; }
     pre { background: #2a2a2a; padding: 15px; overflow: auto; white-space: pre-wrap; max-height: 400px; }
@@ -29,6 +29,9 @@
     }
     #output-area .prompt-text { color: #888; }
     #output-area .generated-text { color: #4caf50; }
+    #output-area .function-call { color: #ff9800; font-weight: bold; }
+    #output-area .function-name { color: #2196f3; }
+    #output-area .function-params { color: #e0e0e0; }
     #timing { margin: 10px 0; padding: 10px; background: #333; border-radius: 5px; color: #aaa; }
     #controls { display: flex; gap: 10px; align-items: center; margin: 10px 0; }
     #controls label { color: #aaa; }
@@ -36,21 +39,25 @@
   </style>
 </head>
 <body>
-  <h1>WebGPU Gemma 3 — 270M Inference</h1>
-  <p>Q8_0 quantized, ~100 t/s on Apple Silicon. Runs entirely in your browser — no server needed.</p>
+  <h1>WebGPU FunctionGemma — 270M Function Calling</h1>
+  <p>Function calling at ~100 t/s on Apple Silicon. Runs entirely in your browser — no server needed.</p>
 
   <div id="status">Loading model...</div>
 
   <div id="prompt-area">
-    <input type="text" id="prompt-input" value="What is the capital of France?" placeholder="Enter a prompt..." disabled>
+    <input type="text" id="prompt-input" value="What's the weather like in Tokyo?" placeholder="Enter a prompt..." disabled>
     <button id="generate-btn" disabled onclick="onGenerate()">Generate</button>
     <button id="debug-btn" disabled onclick="onDebugNaN()" style="padding:12px 24px;font-size:16px;font-family:monospace;cursor:pointer;background:#f44336;color:#fff;border:none;border-radius:5px;">Debug NaN</button>
   </div>
   <div id="controls">
     <label>Max tokens: <input type="number" id="max-tokens" value="2048" min="1" max="2048"></label>
-    <label>Temperature: <input type="number" id="temperature" value="0.7" min="0" max="2" step="0.1" style="width:60px;padding:5px;font-family:monospace;background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:3px;"></label>
+    <label>Temperature: <input type="number" id="temperature" value="0.0" min="0" max="2" step="0.1" style="width:60px;padding:5px;font-family:monospace;background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:3px;"></label>
     <label>Top-p: <input type="number" id="top-p" value="0.9" min="0" max="1" step="0.05" style="width:60px;padding:5px;font-family:monospace;background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:3px;"></label>
-    <label>Rep. penalty: <input type="number" id="rep-penalty" value="1.15" min="1" max="2" step="0.05" style="width:60px;padding:5px;font-family:monospace;background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:3px;"></label>
+    <label>Rep. penalty: <input type="number" id="rep-penalty" value="1.0" min="1" max="2" step="0.05" style="width:60px;padding:5px;font-family:monospace;background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:3px;"></label>
+  </div>
+  <div id="tools-area" style="margin:10px 0;padding:10px;background:#333;border-radius:5px;">
+    <label style="color:#aaa;">Tools (JSON function declarations):</label>
+    <textarea id="tools-input" style="width:100%;height:80px;margin-top:5px;padding:8px;font-family:monospace;font-size:12px;background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:3px;resize:vertical;" disabled>[{"name":"get_current_weather","description":"Gets the current weather in a given location.","parameters":{"properties":{"location":{"description":"The city and state","type":"STRING"},"unit":{"description":"Temperature unit","enum":["celsius","fahrenheit"],"type":"STRING"}},"required":["location"],"type":"OBJECT"}},{"name":"search_web","description":"Searches the web for information.","parameters":{"properties":{"query":{"description":"The search query","type":"STRING"}},"required":["query"],"type":"OBJECT"}}]</textarea>
   </div>
 
   <div id="output-area"></div>
@@ -1241,6 +1248,81 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
       '<bos>': 2,
     };
 
+    // FunctionGemma special tokens - will be populated after tokenizer extraction
+    const FUNC_TOKENS = {};
+    const FUNC_TOKEN_NAMES = [
+      '<start_function_declaration>', '<end_function_declaration>',
+      '<start_function_call>', '<end_function_call>',
+      '<start_function_response>', '<end_function_response>',
+      '<escape>',
+    ];
+
+    function initFunctionTokens() {
+      for (const name of FUNC_TOKEN_NAMES) {
+        const id = tokenByText.get(name);
+        if (id !== undefined) {
+          FUNC_TOKENS[name] = id;
+          SPECIAL_TOKENS[name] = id;
+          log(`  Function token: ${name} -> ${id}`);
+        } else {
+          log(`  WARNING: Function token ${name} not found in vocab`, 'error');
+        }
+      }
+      // Rebuild the regex pattern to include function tokens
+      rebuildSpecialPattern();
+    }
+
+    let specialPatternStr = '<start_of_turn>|<end_of_turn>|<eos>|<bos>';
+    let specialPatternRegex = new RegExp(specialPatternStr.replace(/[<>]/g, c => '\\' + c), 'g');
+
+    function rebuildSpecialPattern() {
+      const allTokenNames = Object.keys(SPECIAL_TOKENS);
+      // Sort by length descending so longer tokens match first
+      allTokenNames.sort((a, b) => b.length - a.length);
+      specialPatternStr = allTokenNames.map(t => t.replace(/[<>]/g, c => '\\' + c)).join('|');
+      specialPatternRegex = new RegExp(specialPatternStr, 'g');
+      log(`  Special token pattern: ${allTokenNames.length} tokens`);
+    }
+
+    // Build FunctionGemma prompt from user query and tool definitions
+    function buildFunctionPrompt(userQuery, toolsJson) {
+      let tools;
+      try {
+        tools = JSON.parse(toolsJson);
+      } catch (e) {
+        log('WARNING: Invalid tools JSON, using plain prompt', 'error');
+        return `<start_of_turn>user\n${userQuery}<end_of_turn>\n<start_of_turn>model\n`;
+      }
+
+      // Build function declarations
+      let declarations = '';
+      for (const tool of tools) {
+        declarations += `<start_function_declaration>declaration:${tool.name}{`;
+        declarations += `description:<escape>${tool.description}<escape>`;
+        if (tool.parameters) {
+          declarations += `,parameters:{properties:{`;
+          const props = Object.entries(tool.parameters.properties || {});
+          declarations += props.map(([k, v]) => {
+            let param = `${k}:{description:<escape>${v.description}<escape>,type:<escape>${v.type}<escape>`;
+            if (v.enum) {
+              param += `,enum:[${v.enum.map(e => `<escape>${e}<escape>`).join(',')}]`;
+            }
+            param += '}';
+            return param;
+          }).join(',');
+          declarations += `}`;
+          if (tool.parameters.required) {
+            declarations += `,required:[${tool.parameters.required.map(r => `<escape>${r}<escape>`).join(',')}]`;
+          }
+          declarations += `,type:<escape>${tool.parameters.type}<escape>`;
+          declarations += `}`;
+        }
+        declarations += `}<end_function_declaration>`;
+      }
+
+      return `<start_of_turn>developer\nYou are a model that can do function calling with the following functions${declarations}<end_of_turn>\n<start_of_turn>user\n${userQuery}<end_of_turn>\n<start_of_turn>model\n`;
+    }
+
     function encodeSegment(text, addPrefix = true) {
       // Encode a text segment using SentencePiece greedy longest-match
       // addPrefix: whether to prepend ▁ (only for standalone text, not after special tokens)
@@ -1279,7 +1361,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
       const tokens = [2]; // BOS token
 
       // Split text on special tokens, preserving them
-      const specialPattern = /<start_of_turn>|<end_of_turn>|<eos>|<bos>/g;
+      const specialPattern = new RegExp(specialPatternRegex.source, 'g');
       let lastIdx = 0;
       let match;
       let afterSpecial = false;
@@ -2853,8 +2935,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
       btn.textContent = 'Generating...';
 
       try {
-        // Wrap in Gemma chat template for IT model
-        const chatPrompt = `<start_of_turn>user\n${prompt}<end_of_turn>\n<start_of_turn>model\n`;
+        // Build FunctionGemma prompt with tool declarations
+        const toolsJson = document.getElementById('tools-input').value;
+        const chatPrompt = buildFunctionPrompt(prompt, toolsJson);
 
         // Encode prompt
         const encodeStart = performance.now();
@@ -2862,7 +2945,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         const encodeTime = performance.now() - encodeStart;
         log(`\nSampling: temperature=${temperature}, top_p=${topP}${temperature === 0 ? ' (greedy)' : ''}`, 'info');
         log(`Encoded prompt: "${prompt}" -> ${inputTokens.length} tokens (${encodeTime.toFixed(1)}ms)`, 'info');
-        log(`  (Wrapped in Gemma chat template)`);
+        log(`  (Wrapped in FunctionGemma prompt with ${JSON.parse(toolsJson).length} tools)`);
         log(`  Token IDs: [${inputTokens.join(', ')}]`);
 
         // Show prompt tokens decoded back
@@ -2976,6 +3059,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
           if (nextToken === 1) break; // EOS
           if (nextToken === 0) break; // PAD
           if (nextToken === 106) break; // <end_of_turn>
+          if (FUNC_TOKENS['<end_function_call>'] && nextToken === FUNC_TOKENS['<end_function_call>']) {
+            generatedTokens.push(nextToken); // include the closing token in output
+            genTokenCount++;
+            break;
+          }
 
           const pos = inputTokens.length + step - 1;
           if (pos >= CONFIG.context_length - 1) {
@@ -2989,6 +3077,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
           if (nextToken === 1) break; // EOS
           if (nextToken === 0) break; // PAD
           if (nextToken === 106) break; // <end_of_turn>
+          if (FUNC_TOKENS['<end_function_call>'] && nextToken === FUNC_TOKENS['<end_function_call>']) {
+            allTokens.push(nextToken);
+            generatedTokens.push(nextToken);
+            genTokenCount++;
+            break;
+          }
 
           allTokens.push(nextToken);
           generatedTokens.push(nextToken);
@@ -3006,10 +3100,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         const totalGenTime = performance.now() - genStart;
         const finalTokPerSec = (genTokenCount / totalGenTime * 1000).toFixed(1);
 
+        // Parse and display function call output nicely
+        const rawOutput = decodeTokens(generatedTokens);
+        const parsedOutput = formatFunctionCallOutput(rawOutput);
+        genSpan.innerHTML = parsedOutput;
+
         timingEl.textContent = `Prefill: ${inputTokens.length} tokens in ${prefillTime.toFixed(0)}ms (${(inputTokens.length / prefillTime * 1000).toFixed(1)} t/s) | Generation: ${genTokenCount} tokens in ${totalGenTime.toFixed(0)}ms (${finalTokPerSec} t/s)`;
         setStatus(`Done: ${genTokenCount} tokens generated at ${finalTokPerSec} tokens/sec`);
         log(`\nGeneration complete: ${genTokenCount} tokens in ${totalGenTime.toFixed(1)}ms (${finalTokPerSec} t/s)`, 'success');
-        log(`Full output: "${decodeTokens(allTokens.slice(1))}"`, 'info');
+        log(`Raw output: "${rawOutput}"`, 'info');
 
       } catch (err) {
         log(`\nGeneration ERROR: ${err.message}`, 'error');
@@ -3024,6 +3123,23 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     function escapeHtml(text) {
       return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function formatFunctionCallOutput(text) {
+      // Try to parse FunctionGemma output format:
+      // <start_function_call>call:func_name{param:<escape>value<escape>}<end_function_call>
+      const callMatch = text.match(/call:(\w+)\{(.*)\}/s);
+      if (callMatch) {
+        const funcName = callMatch[1];
+        const paramsRaw = callMatch[2];
+        // Replace <escape> delimiters with quotes for display
+        const paramsClean = paramsRaw.replace(/<escape>/g, '"');
+        return `<span class="function-call">📞 Function Call:</span>\n` +
+               `<span class="function-name">${escapeHtml(funcName)}</span>` +
+               `<span class="function-params">(${escapeHtml(paramsClean)})</span>`;
+      }
+      // Fallback: just show raw output
+      return `<span class="generated-text">${escapeHtml(text)}</span>`;
     }
 
     // Make generate accessible from button onclick
@@ -3743,14 +3859,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     // =========================================================================
     async function main() {
       try {
-        log('=== Gemma 3 270M - Text Generation ===\n', 'info');
+        log('=== FunctionGemma 270M - Function Calling ===\n', 'info');
 
         setStatus('Initializing WebGPU...');
         await initWebGPU();
 
-        setStatus('Loading GGUF file (291MB)...');
-        const HF_BASE = 'https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/';
-        const defaultModel = HF_BASE + 'gemma-3-270m-it-Q8_0.gguf';
+        setStatus('Loading GGUF file (292MB)...');
+        const HF_BASE = 'https://huggingface.co/unsloth/functiongemma-270m-it-GGUF/resolve/main/';
+        const defaultModel = HF_BASE + 'functiongemma-270m-it-Q8_0.gguf';
         const modelFile = new URLSearchParams(window.location.search).get('model') || defaultModel;
         log(`Loading model: ${modelFile}`, 'info');
 
@@ -3790,6 +3906,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         setStatus('Extracting tokenizer...');
         extractTokenizer();
 
+        setStatus('Initializing function calling tokens...');
+        initFunctionTokens();
+
         setStatus('Creating pipelines...');
         createPipelines();
 
@@ -3817,6 +3936,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         document.getElementById('prompt-input').disabled = false;
         document.getElementById('generate-btn').disabled = false;
         document.getElementById('debug-btn').disabled = false;
+        document.getElementById('tools-input').disabled = false;
 
         // Allow Enter key to trigger generation
         document.getElementById('prompt-input').addEventListener('keydown', (e) => {
