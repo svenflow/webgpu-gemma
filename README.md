@@ -25,9 +25,10 @@ Real device testing via LambdaTest:
 
 | Model | Generation | TTFT | Total time |
 |-------|-----------|------|------------|
+| **Gemma 3 1B** | **34.4 t/s** | **0.45s** | 4.1s |
 | **Gemma 3 270M** | **101.1 t/s** | **0.14s** | 1.4s |
 
-100+ tokens/second on a phone. WebGPU on iOS 26 Safari.
+1B model running at 34 tok/s on a phone — streamed via Range requests, never holding the full 1GB in JS memory. 270M hits 100+ tok/s. WebGPU on iOS 26 Safari.
 
 [Run the benchmark yourself →](https://svenflow.github.io/webgpu-gemma/bench.html)
 
