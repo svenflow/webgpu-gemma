@@ -1,8 +1,8 @@
-# webgpu-gemma
+# gemma-webgpu
 
 Run Gemma 3 1B locally in the browser via WebGPU. Q8_0 quantized, streaming generation, multi-turn chat with KV cache reuse. Zero dependencies.
 
-**[Live Demo](https://svenflow.github.io/webgpu-gemma/)** · **61KB** min · **12KB** gzip
+**[Live Demo](https://svenflow.github.io/gemma-webgpu/)** · **61KB** min · **12KB** gzip
 
 ## Features
 
@@ -16,13 +16,13 @@ Run Gemma 3 1B locally in the browser via WebGPU. Q8_0 quantized, streaming gene
 ## Install
 
 ```bash
-npm install webgpu-gemma
+npm install gemma-webgpu
 ```
 
 ## Usage
 
 ```typescript
-import { createGemmaEngine } from 'webgpu-gemma'
+import { createGemmaEngine } from 'gemma-webgpu'
 
 const engine = await createGemmaEngine({
   model: '1b', // '1b', '270m', or a full URL to a .gguf file

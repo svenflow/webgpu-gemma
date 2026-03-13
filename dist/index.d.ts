@@ -65,14 +65,14 @@ interface GemmaEngine {
 }
 
 /**
- * webgpu-gemma
+ * gemma-webgpu
  *
  * Run Gemma 3 locally in the browser via WebGPU. Q8_0 quantized, streaming
  * generation, multi-turn chat with KV cache reuse.
  *
  * @example
  * ```typescript
- * import { createGemmaEngine } from 'webgpu-gemma'
+ * import { createGemmaEngine } from 'gemma-webgpu'
  *
  * const engine = await createGemmaEngine({
  *   model: '1b',
