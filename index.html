@@ -2640,7 +2640,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     // Detect model size for UI
     const _isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
     const _modelParam = new URLSearchParams(window.location.search).get('model');
-    const _defaultModel = _modelParam || (_isMobile ? '270m' : '1b');
+    const _defaultModel = _modelParam || '1b';
     const _modelSelect = document.getElementById('model-select');
     _modelSelect.value = _defaultModel;
     function _updateStartUI() {
