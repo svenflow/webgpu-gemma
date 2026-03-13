@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
-  <title>FunctionGemma 270M — WebGPU</title>
+  <title>Gemma 270M — WebGPU Chat</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -349,7 +349,7 @@
 
   <!-- Loading Screen -->
   <div id="loading-screen">
-    <div class="loading-title">FunctionGemma 270M</div>
+    <div class="loading-title">Gemma 270M</div>
     <div class="loading-subtitle">WebGPU Inference Engine</div>
     <div class="progress-container">
       <div class="progress-bar-bg"><div class="progress-bar-fill" id="progress-fill"></div></div>
@@ -362,7 +362,7 @@
   <div id="app">
     <header>
       <div class="header-left">
-        <span class="header-title">FunctionGemma 270M</span>
+        <span class="header-title">Gemma 270M</span>
         <span class="badge">WebGPU</span>
       </div>
       <div class="header-right">
@@ -376,7 +376,7 @@
       <div class="settings-inner">
         <div class="setting-group">
           <label>Temperature</label>
-          <input type="number" id="temperature" value="0.0" min="0" max="2" step="0.1">
+          <input type="number" id="temperature" value="0.7" min="0" max="2" step="0.1">
         </div>
         <div class="setting-group">
           <label>Top-P</label>
@@ -392,7 +392,7 @@
         </div>
         <div class="setting-group tools-group">
           <label>Tools (JSON)</label>
-          <textarea id="tools-input">[{"name":"get_current_weather","description":"Gets the current weather in a given location.","parameters":{"properties":{"location":{"description":"The city and state","type":"STRING"},"unit":{"description":"Temperature unit","enum":["celsius","fahrenheit"],"type":"STRING"}},"required":["location"],"type":"OBJECT"}},{"name":"search_web","description":"Searches the web for information.","parameters":{"properties":{"query":{"description":"The search query","type":"STRING"}},"required":["query"],"type":"OBJECT"}}]</textarea>
+          <textarea id="tools-input" placeholder='Add tools for function calling, e.g. [{"name":"get_weather","description":"Get weather","parameters":{...}}]'>[]</textarea>
         </div>
       </div>
     </div>
@@ -400,7 +400,7 @@
     <div id="chat-area">
       <div class="welcome">
         <h2>Ready to chat</h2>
-        <p>Ask anything. This model specializes in function calling.<br>Runs entirely in your browser via WebGPU.</p>
+        <p>Ask anything — runs entirely in your browser via WebGPU at ~100 t/s.<br>Add tools in settings (⚙) to enable function calling.</p>
       </div>
     </div>
 
@@ -1444,8 +1444,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
       let tools;
       try {
         tools = JSON.parse(toolsJson);
+        if (!Array.isArray(tools) || tools.length === 0) {
+          return `<start_of_turn>user\n${userQuery}<end_of_turn>\n<start_of_turn>model\n`;
+        }
       } catch (e) {
-        log('WARNING: Invalid tools JSON, using plain prompt', 'error');
+        // No valid tools — use plain chat prompt
         return `<start_of_turn>user\n${userQuery}<end_of_turn>\n<start_of_turn>model\n`;
       }
       let declarations = '';
