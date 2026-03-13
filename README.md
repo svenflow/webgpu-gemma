@@ -2,7 +2,22 @@
 
 Run Gemma 3 1B locally in the browser via WebGPU. Q8_0 quantized, streaming generation, multi-turn chat with KV cache reuse. Zero dependencies.
 
-**[Live Demo](https://svenflow.github.io/gemma-webgpu/)** · **61KB** min · **12KB** gzip
+**[Live Demo](https://svenflow.github.io/gemma-webgpu/)** · **50KB** min · **12KB** gzip
+
+## Benchmarks
+
+Compared against [transformers.js](https://huggingface.co/docs/transformers.js) (ONNX Runtime WebGPU). Mac Mini M4 Pro, Chrome 134.
+
+| Model | Engine | Quant | Generation | TTFT |
+|-------|--------|-------|-----------|------|
+| **Gemma 3 270M** | **gemma-webgpu** | Q8_0 | **136.8 t/s** | **0.11s** |
+| Gemma 3 270M | transformers.js | q4 | 41.7 t/s | 0.51s |
+| **Gemma 3 1B** | **gemma-webgpu** | Q8_0 | **59.8 t/s** | **0.28s** |
+| Gemma 3 1B | transformers.js | q4 | crashes | — |
+
+**3.3x faster on 270M** with higher-fidelity Q8_0 quantization. transformers.js can't load the 1B model (ONNX WebGPU abort).
+
+[Run the benchmark yourself →](https://svenflow.github.io/webgpu-gemma/bench.html)
 
 ## Features
 

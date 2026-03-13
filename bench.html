@@ -336,11 +336,15 @@
         console.error('gemma-webgpu error:', e);
       }
 
-      try {
-        theirsResult = await window.runTransformersJS(modelSize, prompt);
-      } catch(e) {
-        document.getElementById('theirs-status').textContent = 'Error: ' + e.message;
-        console.error('transformers.js error:', e);
+      if (!window._oursOnly) {
+        try {
+          theirsResult = await window.runTransformersJS(modelSize, prompt);
+        } catch(e) {
+          document.getElementById('theirs-status').textContent = 'Error: ' + e.message;
+          console.error('transformers.js error:', e);
+        }
+      } else {
+        document.getElementById('theirs-status').textContent = 'Skipped (ours_only mode)';
       }
 
       // Compare results
@@ -378,6 +382,19 @@
 
       btn.disabled = false;
       btn.textContent = 'Run Benchmark';
+    }
+
+    // Support ?autostart=270m or ?autostart=1b
+    const params = new URLSearchParams(location.search);
+    const autostart = params.get('autostart');
+    if (autostart) {
+      const modelSelect = document.getElementById('model-select');
+      if (autostart === '270m' || autostart === '1b') {
+        modelSelect.value = autostart;
+      }
+      // Also support ?ours_only=1 to skip transformers.js
+      window._oursOnly = params.get('ours_only') === '1';
+      setTimeout(() => runBenchmark(), 500);
     }
   </script>
 </body>
