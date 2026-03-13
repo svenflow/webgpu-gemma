@@ -2445,9 +2445,13 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         await initWebGPU();
 
         setStatus('Downloading model...');
-        const HF_BASE = 'https://huggingface.co/unsloth/functiongemma-270m-it-GGUF/resolve/main/';
-        const defaultModel = HF_BASE + 'functiongemma-270m-it-Q8_0.gguf';
-        const modelFile = new URLSearchParams(window.location.search).get('model') || defaultModel;
+        // Base Gemma 3 for chat, FunctionGemma for tool calling (use ?model=func to load FunctionGemma)
+        const MODELS = {
+          base: 'https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q8_0.gguf',
+          func: 'https://huggingface.co/unsloth/functiongemma-270m-it-GGUF/resolve/main/functiongemma-270m-it-Q8_0.gguf',
+        };
+        const modelParam = new URLSearchParams(window.location.search).get('model');
+        const modelFile = modelParam === 'func' ? MODELS.func : (modelParam || MODELS.base);
 
         const response = await fetch(modelFile);
         const contentLength = response.headers.get('content-length');
