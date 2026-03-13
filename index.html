@@ -919,7 +919,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
   output[m] = sum0 + sum1 + sum2 + sum3;
 }`,
 
-      siluMul: `
+      geluMul: `
 const SQRT_2_OVER_PI: f32 = 0.7978845608028654;
 const GELU_COEF_A: f32 = 0.044715;
 
@@ -2150,8 +2150,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             { binding: 3, resource: { buffer: uniformBuffers.linearQ8_I_H } },
           ],
         });
-        lb.siluMul = device.createBindGroup({
-          layout: pipelines.siluMul.getBindGroupLayout(0),
+        lb.geluMul = device.createBindGroup({
+          layout: pipelines.geluMul.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: workBuffers.ffnGate } },
             { binding: 1, resource: { buffer: workBuffers.ffnUp } },
@@ -2273,7 +2273,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         pass.setBindGroup(0, lb.ffnGate); pass.dispatchWorkgroups(Math.ceil(I / 256));
         pass.setBindGroup(0, lb.ffnUp); pass.dispatchWorkgroups(Math.ceil(I / 256));
         pass.end();
-        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.siluMul); pass.setBindGroup(0, lb.siluMul); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.geluMul); pass.setBindGroup(0, lb.geluMul); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
         pass = encoder.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.ffnDown); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
         pass = encoder.beginComputePass(); pass.setPipeline(pipelines.fusedNormAdd); pass.setBindGroup(0, lb.fusedPostFfnNormAdd); pass.dispatchWorkgroups(1); pass.end();
       }
@@ -2418,7 +2418,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         pass.setBindGroup(0, lb.ffnGate); pass.dispatchWorkgroups(Math.ceil(I / 256));
         pass.setBindGroup(0, lb.ffnUp); pass.dispatchWorkgroups(Math.ceil(I / 256));
         pass.end();
-        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.siluMul); pass.setBindGroup(0, lb.siluMul); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
+        pass = encoder.beginComputePass(); pass.setPipeline(pipelines.geluMul); pass.setBindGroup(0, lb.geluMul); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
         pass = encoder.beginComputePass(); pass.setPipeline(pipelines.linearQ8); pass.setBindGroup(0, lb.ffnDown); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
         pass = encoder.beginComputePass(); pass.setPipeline(pipelines.fusedNormAdd); pass.setBindGroup(0, lb.fusedPostFfnNormAdd); pass.dispatchWorkgroups(1); pass.end();
       }

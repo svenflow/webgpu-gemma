@@ -75,6 +75,7 @@ Returns an `AsyncGenerator<string>` that yields decoded tokens.
 | `repPenalty` | `number` | `1.2` | Repetition penalty. 1.0 = none |
 | `maxTokens` | `number` | `32768` | Maximum tokens to generate |
 | `toolsJson` | `string` | `'[]'` | JSON array of tool declarations for function calling |
+| `signal` | `AbortSignal` | — | AbortSignal to cancel generation mid-stream |
 
 ### `engine.resetConversation()`
 

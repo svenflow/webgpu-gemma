@@ -1,0 +1,49 @@
+{
+  "name": "webgpu-gemma",
+  "version": "0.1.0",
+  "description": "Run Gemma 3 locally in the browser via WebGPU. Q8_0 quantized, streaming generation, multi-turn chat with KV cache reuse.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --minify",
+    "dev": "tsup src/index.ts --format esm --dts --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "gemma",
+    "webgpu",
+    "llm",
+    "inference",
+    "gguf",
+    "quantized",
+    "q8",
+    "browser",
+    "ai",
+    "ml",
+    "transformer"
+  ],
+  "author": "svenflow",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/svenflow/webgpu-gemma"
+  },
+  "homepage": "https://svenflow.github.io/webgpu-gemma/",
+  "devDependencies": {
+    "@webgpu/types": "^0.1.40",
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "license": "MIT"
+}
