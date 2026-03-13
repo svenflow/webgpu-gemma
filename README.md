@@ -6,7 +6,9 @@ Run Gemma 3 1B locally in the browser via WebGPU. Q8_0 quantized, streaming gene
 
 ## Benchmarks
 
-Compared against [transformers.js](https://huggingface.co/docs/transformers.js) (ONNX Runtime WebGPU). Mac Mini M4 Pro, Chrome 134.
+### Mac Mini M4 Pro — Chrome 134
+
+Compared against [transformers.js](https://huggingface.co/docs/transformers.js) (ONNX Runtime WebGPU):
 
 | Model | Engine | Quant | Generation | TTFT |
 |-------|--------|-------|-----------|------|
@@ -16,6 +18,16 @@ Compared against [transformers.js](https://huggingface.co/docs/transformers.js) 
 | Gemma 3 1B | transformers.js | q4 | crashes | — |
 
 **3.3x faster on 270M** with higher-fidelity Q8_0 quantization. transformers.js can't load the 1B model (ONNX WebGPU abort).
+
+### iPhone 17 Pro Max — Safari, iOS 26
+
+Real device testing via LambdaTest:
+
+| Model | Generation | TTFT | Total time |
+|-------|-----------|------|------------|
+| **Gemma 3 270M** | **101.1 t/s** | **0.14s** | 1.4s |
+
+100+ tokens/second on a phone. WebGPU on iOS 26 Safari.
 
 [Run the benchmark yourself →](https://svenflow.github.io/webgpu-gemma/bench.html)
 
