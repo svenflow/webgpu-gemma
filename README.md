@@ -1,8 +1,8 @@
 # webgpu-gemma
 
-Run Gemma 3 locally in the browser via WebGPU. Q8_0 quantized, streaming generation, multi-turn chat with KV cache reuse. Zero dependencies.
+Run Gemma 3 1B locally in the browser via WebGPU. Q8_0 quantized, streaming generation, multi-turn chat with KV cache reuse. Zero dependencies.
 
-**[Live Demo](https://svenflow.github.io/webgpu-gemma/)**
+**[Live Demo](https://svenflow.github.io/webgpu-gemma/)** · **61KB** min · **12KB** gzip
 
 ## Features
 
@@ -11,7 +11,7 @@ Run Gemma 3 locally in the browser via WebGPU. Q8_0 quantized, streaming generat
 - **Streaming generation** — async iterator API, tokens streamed as generated
 - **Multi-turn chat** — KV cache reuse for fast follow-up messages
 - **Range request loading** — streams weights layer-by-layer, works on iPhone
-- **61KB bundle** — zero dependencies, pure WebGPU compute shaders
+- **12KB gzipped** — zero dependencies, pure WebGPU compute shaders
 
 ## Install
 
