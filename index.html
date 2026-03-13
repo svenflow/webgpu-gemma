@@ -432,7 +432,7 @@
         </div>
         <div class="setting-group">
           <label>Max Tokens</label>
-          <input type="number" id="max-tokens" value="2048" min="1" max="32768">
+          <input type="number" id="max-tokens" value="32768" min="1" max="32768">
         </div>
         <div class="setting-group tools-group">
           <label>Tools (JSON)</label>
@@ -2597,7 +2597,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         const toolsJson = document.getElementById('tools-input').value;
         const chatPrompt = buildFunctionPrompt(prompt, toolsJson);
         const inputTokens = encodeSimple(chatPrompt);
-        const maxTokens = parseInt(document.getElementById('max-tokens').value) || 2048;
+        const maxTokens = parseInt(document.getElementById('max-tokens').value) || 32768;
         const temperature = parseFloat(document.getElementById('temperature').value) || 0;
         const topP = parseFloat(document.getElementById('top-p').value) || 0.9;
         const repPenalty = parseFloat(document.getElementById('rep-penalty').value) || 1.0;
