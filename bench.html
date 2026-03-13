@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gemma 3 1B Benchmark — gemma-webgpu vs transformers.js</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #1e2028; --bg2: #252830; --bg3: #2c2f3a;
+      --text: #e8e9ed; --text2: #9a9ca6; --muted: #6b6d77;
+      --amber: #e5a54b; --blue: #5b9bd5; --green: #6bbf7a; --red: #d55b5b;
+      --border: #353845;
+      --font: 'DM Sans', -apple-system, sans-serif;
+      --mono: 'JetBrains Mono', monospace;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { background: var(--bg); color: var(--text); font-family: var(--font); min-height: 100vh; }
+
+    .container { max-width: 900px; margin: 0 auto; padding: 32px 20px; }
+
+    h1 { font-family: var(--mono); font-size: 22px; font-weight: 500; margin-bottom: 4px; }
+    .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 32px; }
+
+    .config { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 24px; }
+    .config label { color: var(--text2); font-size: 13px; }
+    .config select, .config input {
+      background: var(--bg2); color: var(--text); border: 1px solid var(--border);
+      border-radius: 6px; padding: 6px 10px; font-family: var(--font); font-size: 13px;
+    }
+    .config input { width: 400px; }
+
+    .run-btn {
+      padding: 10px 32px; font-family: var(--font); font-size: 14px; font-weight: 600;
+      background: var(--amber); color: #1a1a1a; border: none; border-radius: 6px;
+      cursor: pointer; transition: background 0.2s;
+    }
+    .run-btn:hover { background: #d4963f; }
+    .run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .results { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 24px; }
+    @media (max-width: 600px) { .results { grid-template-columns: 1fr; } }
+
+    .card {
+      background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+      padding: 20px; position: relative;
+    }
+    .card h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+    .card.ours h2 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--amber); }
+    .card.theirs h2 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--blue); }
+
+    .metric { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border); }
+    .metric:last-child { border-bottom: none; }
+    .metric-label { color: var(--text2); font-size: 13px; }
+    .metric-value { font-family: var(--mono); font-size: 14px; font-weight: 500; }
+    .metric-value.winner { color: var(--green); }
+    .metric-value.loser { color: var(--red); }
+
+    .status { font-size: 12px; color: var(--muted); font-family: var(--mono); margin-top: 8px; min-height: 18px; }
+
+    .output-section { margin-top: 24px; }
+    .output-section h3 { font-size: 14px; font-weight: 500; margin-bottom: 8px; color: var(--text2); }
+    .output-box {
+      background: var(--bg3); border: 1px solid var(--border); border-radius: 8px;
+      padding: 12px; font-family: var(--mono); font-size: 12px; line-height: 1.6;
+      min-height: 80px; max-height: 200px; overflow-y: auto; white-space: pre-wrap;
+      color: var(--text2);
+    }
+
+    .summary {
+      margin-top: 24px; background: var(--bg2); border: 1px solid var(--border);
+      border-radius: 10px; padding: 20px; text-align: center;
+    }
+    .summary h2 { font-size: 16px; margin-bottom: 12px; }
+    .speedup { font-family: var(--mono); font-size: 36px; font-weight: 600; color: var(--green); }
+    .speedup-label { color: var(--text2); font-size: 13px; margin-top: 4px; }
+
+    .progress-bar {
+      width: 100%; height: 3px; background: var(--bg3); border-radius: 2px;
+      margin-top: 8px; overflow: hidden;
+    }
+    .progress-fill { height: 100%; width: 0%; border-radius: 2px; transition: width 0.2s; }
+    .card.ours .progress-fill { background: var(--amber); }
+    .card.theirs .progress-fill { background: var(--blue); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Gemma 3 Benchmark</h1>
+    <div class="subtitle">gemma-webgpu (custom WGSL shaders) vs transformers.js (ONNX Runtime WebGPU)</div>
+
+    <div class="config">
+      <label>Model:</label>
+      <select id="model-select">
+        <option value="1b">Gemma 3 1B</option>
+        <option value="270m">Gemma 3 270M</option>
+      </select>
+      <label>Prompt:</label>
+      <input id="prompt-input" type="text" value="Explain how WebGPU works in 3 sentences.">
+    </div>
+
+    <button class="run-btn" id="run-btn" onclick="runBenchmark()">Run Benchmark</button>
+
+    <div class="results">
+      <div class="card ours" id="card-ours">
+        <h2><span class="dot"></span>gemma-webgpu</h2>
+        <div class="metric"><span class="metric-label">Load time</span><span class="metric-value" id="ours-load">—</span></div>
+        <div class="metric"><span class="metric-label">Time to first token</span><span class="metric-value" id="ours-ttft">—</span></div>
+        <div class="metric"><span class="metric-label">Generation speed</span><span class="metric-value" id="ours-tps">—</span></div>
+        <div class="metric"><span class="metric-label">Total tokens</span><span class="metric-value" id="ours-tokens">—</span></div>
+        <div class="metric"><span class="metric-label">Total time</span><span class="metric-value" id="ours-total">—</span></div>
+        <div class="progress-bar"><div class="progress-fill" id="ours-progress"></div></div>
+        <div class="status" id="ours-status"></div>
+      </div>
+
+      <div class="card theirs" id="card-theirs">
+        <h2><span class="dot"></span>transformers.js</h2>
+        <div class="metric"><span class="metric-label">Load time</span><span class="metric-value" id="theirs-load">—</span></div>
+        <div class="metric"><span class="metric-label">Time to first token</span><span class="metric-value" id="theirs-ttft">—</span></div>
+        <div class="metric"><span class="metric-label">Generation speed</span><span class="metric-value" id="theirs-tps">—</span></div>
+        <div class="metric"><span class="metric-label">Total tokens</span><span class="metric-value" id="theirs-tokens">—</span></div>
+        <div class="metric"><span class="metric-label">Total time</span><span class="metric-value" id="theirs-total">—</span></div>
+        <div class="progress-bar"><div class="progress-fill" id="theirs-progress"></div></div>
+        <div class="status" id="theirs-status"></div>
+      </div>
+    </div>
+
+    <div class="summary" id="summary" style="display:none;">
+      <h2>Result</h2>
+      <div class="speedup" id="speedup-value"></div>
+      <div class="speedup-label" id="speedup-label"></div>
+    </div>
+
+    <div class="output-section">
+      <h3>gemma-webgpu output</h3>
+      <div class="output-box" id="ours-output"></div>
+      <h3 style="margin-top:12px">transformers.js output</h3>
+      <div class="output-box" id="theirs-output"></div>
+    </div>
+  </div>
+
+  <!-- transformers.js from CDN -->
+  <script type="module">
+    import { pipeline, TextStreamer } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.6.0';
+
+    // ═══════════════════════════════════════════════════════════════
+    // TRANSFORMERS.JS BENCHMARK
+    // ═══════════════════════════════════════════════════════════════
+
+    window.runTransformersJS = async function(modelSize, prompt) {
+      const status = document.getElementById('theirs-status');
+      const progress = document.getElementById('theirs-progress');
+      const output = document.getElementById('theirs-output');
+      output.textContent = '';
+
+      // Pick the right model
+      const models = {
+        '1b': 'onnx-community/gemma-3-1b-it-ONNX-GQA',
+        '270m': 'onnx-community/gemma-3-270m-it-ONNX',
+      };
+      const modelId = models[modelSize];
+      if (!modelId) throw new Error(`No transformers.js model for ${modelSize}`);
+
+      // Load model
+      status.textContent = 'Loading model...';
+      const loadStart = performance.now();
+
+      const generator = await pipeline('text-generation', modelId, {
+        dtype: 'q4',
+        device: 'webgpu',
+        progress_callback: (p) => {
+          if (p.status === 'progress' && p.total) {
+            const pct = Math.round((p.loaded / p.total) * 100);
+            progress.style.width = pct + '%';
+            status.textContent = `Downloading: ${pct}%`;
+          }
+        },
+      });
+
+      const loadTime = performance.now() - loadStart;
+      document.getElementById('theirs-load').textContent = (loadTime / 1000).toFixed(1) + 's';
+      progress.style.width = '100%';
+
+      // Generate with streaming
+      status.textContent = 'Generating...';
+      const messages = [{ role: 'user', content: prompt }];
+
+      let tokenCount = 0;
+      let firstTokenTime = null;
+      const genStart = performance.now();
+
+      const streamer = new TextStreamer(generator.tokenizer, {
+        skip_prompt: true,
+        skip_special_tokens: true,
+        callback_function: (text) => {
+          output.textContent += text;
+          output.scrollTop = output.scrollHeight;
+        },
+        token_callback_function: (token) => {
+          tokenCount++;
+          if (tokenCount === 1) {
+            firstTokenTime = performance.now() - genStart;
+          }
+        },
+      });
+
+      await generator(messages, {
+        max_new_tokens: 128,
+        do_sample: false,
+        streamer: streamer,
+      });
+
+      const totalGenTime = performance.now() - genStart;
+      const genOnlyTime = totalGenTime - (firstTokenTime || 0);
+      const tps = tokenCount > 1 ? ((tokenCount - 1) / (genOnlyTime / 1000)) : 0;
+
+      document.getElementById('theirs-ttft').textContent = firstTokenTime ? (firstTokenTime / 1000).toFixed(2) + 's' : '—';
+      document.getElementById('theirs-tps').textContent = tps.toFixed(1) + ' t/s';
+      document.getElementById('theirs-tokens').textContent = tokenCount;
+      document.getElementById('theirs-total').textContent = (totalGenTime / 1000).toFixed(1) + 's';
+      status.textContent = 'Done';
+
+      // Clean up
+      try { await generator.dispose(); } catch(e) {}
+
+      return { loadTime, ttft: firstTokenTime, tps, tokenCount, totalTime: totalGenTime };
+    };
+  </script>
+
+  <script>
+    // ═══════════════════════════════════════════════════════════════
+    // GEMMA-WEBGPU BENCHMARK (inline engine from index.html)
+    // ═══════════════════════════════════════════════════════════════
+
+    // We import the engine code from the existing index.html inline
+    // For now, use the same GGUF-based engine
+
+    window.runGemmaWebGPU = async function(modelSize, prompt) {
+      const status = document.getElementById('ours-status');
+      const progress = document.getElementById('ours-progress');
+      const output = document.getElementById('ours-output');
+      output.textContent = '';
+
+      const MODELS = {
+        '1b': 'https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q8_0.gguf',
+        '270m': 'https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q8_0.gguf',
+      };
+
+      status.textContent = 'Loading engine...';
+      const loadStart = performance.now();
+
+      // Dynamically import the built library from dist/
+      const { createGemmaEngine } = await import('./dist/index.js');
+
+      const engine = await createGemmaEngine({
+        model: modelSize,
+        contextLength: 2048,
+        onProgress: (p) => {
+          if (p.total > 0) {
+            const pct = Math.round((p.loaded / p.total) * 100);
+            progress.style.width = pct + '%';
+            status.textContent = p.status + ` (${pct}%)`;
+          }
+        },
+      });
+
+      const loadTime = performance.now() - loadStart;
+      document.getElementById('ours-load').textContent = (loadTime / 1000).toFixed(1) + 's';
+      progress.style.width = '100%';
+
+      // Generate
+      status.textContent = 'Generating...';
+      engine.addUserMessage(prompt);
+
+      let tokenCount = 0;
+      let firstTokenTime = null;
+      const genStart = performance.now();
+
+      for await (const token of engine.generate({ temperature: 0, maxTokens: 128, repPenalty: 1.0 })) {
+        tokenCount++;
+        if (tokenCount === 1) {
+          firstTokenTime = performance.now() - genStart;
+        }
+        output.textContent += token;
+        output.scrollTop = output.scrollHeight;
+      }
+
+      const totalGenTime = performance.now() - genStart;
+      const genOnlyTime = totalGenTime - (firstTokenTime || 0);
+      const tps = tokenCount > 1 ? ((tokenCount - 1) / (genOnlyTime / 1000)) : 0;
+
+      document.getElementById('ours-ttft').textContent = firstTokenTime ? (firstTokenTime / 1000).toFixed(2) + 's' : '—';
+      document.getElementById('ours-tps').textContent = tps.toFixed(1) + ' t/s';
+      document.getElementById('ours-tokens').textContent = tokenCount;
+      document.getElementById('ours-total').textContent = (totalGenTime / 1000).toFixed(1) + 's';
+      status.textContent = 'Done';
+
+      engine.dispose();
+      return { loadTime, ttft: firstTokenTime, tps, tokenCount, totalTime: totalGenTime };
+    };
+
+    // ═══════════════════════════════════════════════════════════════
+    // BENCHMARK RUNNER
+    // ═══════════════════════════════════════════════════════════════
+
+    async function runBenchmark() {
+      const btn = document.getElementById('run-btn');
+      btn.disabled = true;
+      btn.textContent = 'Running...';
+
+      const modelSize = document.getElementById('model-select').value;
+      const prompt = document.getElementById('prompt-input').value;
+
+      // Reset UI
+      ['ours', 'theirs'].forEach(prefix => {
+        ['load', 'ttft', 'tps', 'tokens', 'total'].forEach(m => {
+          const el = document.getElementById(`${prefix}-${m}`);
+          el.textContent = '—';
+          el.className = 'metric-value';
+        });
+        document.getElementById(`${prefix}-progress`).style.width = '0%';
+        document.getElementById(`${prefix}-status`).textContent = '';
+        document.getElementById(`${prefix}-output`).textContent = '';
+      });
+      document.getElementById('summary').style.display = 'none';
+
+      let oursResult, theirsResult;
+
+      // Run sequentially to avoid GPU contention
+      try {
+        oursResult = await window.runGemmaWebGPU(modelSize, prompt);
+      } catch(e) {
+        document.getElementById('ours-status').textContent = 'Error: ' + e.message;
+        console.error('gemma-webgpu error:', e);
+      }
+
+      try {
+        theirsResult = await window.runTransformersJS(modelSize, prompt);
+      } catch(e) {
+        document.getElementById('theirs-status').textContent = 'Error: ' + e.message;
+        console.error('transformers.js error:', e);
+      }
+
+      // Compare results
+      if (oursResult && theirsResult) {
+        // Highlight winners
+        const compare = (oursId, theirsId, oursVal, theirsVal, lowerBetter) => {
+          const oursEl = document.getElementById(oursId);
+          const theirsEl = document.getElementById(theirsId);
+          const oursWins = lowerBetter ? oursVal < theirsVal : oursVal > theirsVal;
+          oursEl.classList.add(oursWins ? 'winner' : 'loser');
+          theirsEl.classList.add(oursWins ? 'loser' : 'winner');
+        };
+
+        compare('ours-load', 'theirs-load', oursResult.loadTime, theirsResult.loadTime, true);
+        if (oursResult.ttft && theirsResult.ttft) {
+          compare('ours-ttft', 'theirs-ttft', oursResult.ttft, theirsResult.ttft, true);
+        }
+        compare('ours-tps', 'theirs-tps', oursResult.tps, theirsResult.tps, false);
+        compare('ours-total', 'theirs-total', oursResult.totalTime, theirsResult.totalTime, true);
+
+        // Summary
+        const speedup = oursResult.tps / theirsResult.tps;
+        const summary = document.getElementById('summary');
+        summary.style.display = 'block';
+        document.getElementById('speedup-value').textContent = speedup.toFixed(1) + 'x';
+        if (speedup > 1) {
+          document.getElementById('speedup-label').textContent = `gemma-webgpu is ${speedup.toFixed(1)}x faster (${oursResult.tps.toFixed(1)} vs ${theirsResult.tps.toFixed(1)} tok/s)`;
+          document.getElementById('speedup-value').style.color = 'var(--green)';
+        } else {
+          document.getElementById('speedup-label').textContent = `transformers.js is ${(1/speedup).toFixed(1)}x faster (${theirsResult.tps.toFixed(1)} vs ${oursResult.tps.toFixed(1)} tok/s)`;
+          document.getElementById('speedup-value').style.color = 'var(--red)';
+          document.getElementById('speedup-value').textContent = (1/speedup).toFixed(1) + 'x';
+        }
+      }
+
+      btn.disabled = false;
+      btn.textContent = 'Run Benchmark';
+    }
+  </script>
+</body>
+</html>
