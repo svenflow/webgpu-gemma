@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
-  <title>Gemma 3 — WebGPU Chat</title>
+  <title>Gemma 3 1B — WebGPU Chat</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -382,7 +382,7 @@
 
   <!-- Loading Screen -->
   <div id="loading-screen">
-    <div class="loading-title">Gemma 3</div>
+    <div class="loading-title">Gemma 3 1B</div>
     <div class="loading-subtitle">WebGPU Inference Engine</div>
     <div id="start-section" style="text-align:center;">
       <div style="margin-bottom:12px;">
@@ -2825,7 +2825,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
       document.getElementById('start-subtext').innerHTML =
         `Downloads ${sizeText} of model weights to run locally in your browser.<br>No data leaves your device.`;
       document.querySelector('.loading-title').textContent =
-        sel === '1b' ? 'Gemma 3' : 'Gemma 3 270M';
+        sel === '1b' ? 'Gemma 3 1B' : 'Gemma 3 270M';
     }
     _modelSelect.addEventListener('change', _updateStartUI);
     _updateStartUI();
