@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
   <title>FunctionGemma 270M — WebGPU</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -37,10 +37,14 @@
 
     html, body {
       height: 100%;
+      height: 100dvh;
       background: var(--bg-primary);
       color: var(--text-primary);
       font-family: var(--font-ui);
       overflow: hidden;
+      /* Prevent iOS bounce/overscroll */
+      overscroll-behavior: none;
+      -webkit-overflow-scrolling: touch;
     }
 
     /* ── Loading Screen ── */
@@ -91,6 +95,7 @@
     #app {
       display: flex; flex-direction: column;
       height: 100vh;
+      height: 100dvh;
       opacity: 0; transition: opacity 0.4s ease;
     }
     #app.visible { opacity: 1; }
@@ -284,7 +289,7 @@
 
     /* ── Input Area ── */
     #input-area {
-      padding: 12px 20px 16px;
+      padding: 12px 20px calc(16px + env(safe-area-inset-bottom, 0px));
       border-top: 1px solid var(--border);
       background: var(--bg-secondary);
       flex-shrink: 0;
@@ -330,8 +335,10 @@
     @media (max-width: 600px) {
       .message { padding: 10px 14px; }
       header { padding: 10px 14px; }
-      #input-area { padding: 10px 14px 14px; }
+      #input-area { padding: 10px 14px calc(14px + env(safe-area-inset-bottom, 0px)); }
       .settings-inner { padding: 12px 14px; }
+      #send-btn { padding: 10px 14px; }
+      .header-left span { font-size: 14px; }
     }
 
     /* ── Debug console (hidden) ── */
@@ -2513,6 +2520,19 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
         // Send button
         document.getElementById('send-btn').addEventListener('click', sendMessage);
+
+        // iOS keyboard: resize app to visual viewport
+        if (window.visualViewport) {
+          const onViewportResize = () => {
+            const app = document.getElementById('app');
+            app.style.height = window.visualViewport.height + 'px';
+            // Scroll chat to bottom when keyboard opens
+            const chat = document.getElementById('chat-area');
+            chat.scrollTop = chat.scrollHeight;
+          };
+          window.visualViewport.addEventListener('resize', onViewportResize);
+          window.visualViewport.addEventListener('scroll', onViewportResize);
+        }
 
       } catch (err) {
         console.error(err);
