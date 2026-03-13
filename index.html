@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
-  <title>Gemma 270M — WebGPU Chat</title>
+  <title>Gemma 3 — WebGPU Chat</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -89,6 +89,27 @@
     .loading-status {
       font-size: 12px; color: var(--text-secondary);
       margin-top: 20px;
+    }
+    #start-btn {
+      padding: 14px 48px;
+      font-family: var(--font-ui);
+      font-size: 16px; font-weight: 600;
+      background: var(--amber);
+      color: #1a1a1a;
+      border: none;
+      border-radius: var(--radius);
+      cursor: pointer;
+      transition: background 0.2s, transform 0.1s;
+      margin-top: 8px;
+    }
+    #start-btn:hover { background: #d4963f; }
+    #start-btn:active { transform: scale(0.97); }
+    .start-subtext {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 14px;
+      line-height: 1.5;
+      text-align: center;
     }
 
     /* ── App Layout ── */
@@ -341,6 +362,21 @@
       .header-left span { font-size: 14px; }
     }
 
+    /* ── Canvas rendering ── */
+    .canvas-container {
+      margin-top: 8px;
+      border: 1px solid var(--fn-card-border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      display: inline-block;
+      max-width: 100%;
+    }
+    .canvas-container canvas {
+      display: block;
+      max-width: 100%;
+      height: auto;
+    }
+
     /* ── Debug console (hidden) ── */
     #debug-log { display: none; }
   </style>
@@ -349,20 +385,26 @@
 
   <!-- Loading Screen -->
   <div id="loading-screen">
-    <div class="loading-title">Gemma 270M</div>
+    <div class="loading-title">Gemma 3</div>
     <div class="loading-subtitle">WebGPU Inference Engine</div>
-    <div class="progress-container">
-      <div class="progress-bar-bg"><div class="progress-bar-fill" id="progress-fill"></div></div>
-      <div class="progress-text" id="progress-text">Initializing...</div>
+    <div id="start-section">
+      <button id="start-btn" onclick="startLoading()">Start</button>
+      <div class="start-subtext">Downloads ~1 GB of model weights to run locally in your browser.<br>No data leaves your device.</div>
     </div>
-    <div class="loading-status" id="loading-status"></div>
+    <div id="progress-section" style="display:none;">
+      <div class="progress-container">
+        <div class="progress-bar-bg"><div class="progress-bar-fill" id="progress-fill"></div></div>
+        <div class="progress-text" id="progress-text">Initializing...</div>
+      </div>
+      <div class="loading-status" id="loading-status"></div>
+    </div>
   </div>
 
   <!-- App -->
   <div id="app">
     <header>
       <div class="header-left">
-        <span class="header-title">Gemma 270M</span>
+        <span class="header-title" id="header-title">Gemma 3</span>
         <span class="badge">WebGPU</span>
       </div>
       <div class="header-right">
@@ -388,11 +430,11 @@
         </div>
         <div class="setting-group">
           <label>Max Tokens</label>
-          <input type="number" id="max-tokens" value="2048" min="1" max="2048">
+          <input type="number" id="max-tokens" value="2048" min="1" max="32768">
         </div>
         <div class="setting-group tools-group">
           <label>Tools (JSON)</label>
-          <textarea id="tools-input" placeholder='Add tools for function calling, e.g. [{"name":"get_weather","description":"Get weather","parameters":{...}}]'>[]</textarea>
+          <textarea id="tools-input" placeholder='Tools JSON for function calling'>[]</textarea>
         </div>
       </div>
     </div>
@@ -400,7 +442,7 @@
     <div id="chat-area">
       <div class="welcome">
         <h2>Ready to chat</h2>
-        <p>Ask anything — runs entirely in your browser via WebGPU at ~100 t/s.<br>Add tools in settings (⚙) to enable function calling.</p>
+        <p>Ask anything — runs entirely in your browser via WebGPU.</p>
       </div>
     </div>
 
@@ -444,9 +486,9 @@
     }
 
     // =========================================================================
-    // Model Configuration - CORRECT Gemma 3 270M architecture
+    // Model Configuration - defaults for Gemma 3 270M, updated from GGUF metadata
     // =========================================================================
-    const CONFIG = {
+    let CONFIG = {
       hidden_size: 640,
       q_dim: 1024,
       kv_dim: 256,
@@ -462,6 +504,40 @@
       rope_theta_swa: 1000000.0,
       swa_period: 6,
     };
+
+    function updateConfigFromGGUF(gguf) {
+      const getKV = (key) => {
+        const entry = gguf.kv.get(key);
+        return entry ? (typeof entry.value === 'object' ? Number(entry.value) : Number(entry.value)) : null;
+      };
+
+      const hidden = getKV('gemma3.embedding_length');
+      const layers = getKV('gemma3.block_count');
+      const intermediate = getKV('gemma3.feed_forward_length');
+      const qHeads = getKV('gemma3.attention.head_count');
+      const kvHeads = getKV('gemma3.attention.head_count_kv');
+      const headDim = getKV('gemma3.attention.key_length');
+      const ctxLen = getKV('gemma3.context_length');
+
+      if (hidden !== null) CONFIG.hidden_size = hidden;
+      if (layers !== null) CONFIG.num_layers = layers;
+      if (intermediate !== null) CONFIG.intermediate_size = intermediate;
+      if (qHeads !== null) CONFIG.num_q_heads = qHeads;
+      if (kvHeads !== null) CONFIG.num_kv_heads = kvHeads;
+      if (headDim !== null) CONFIG.head_dim = headDim;
+      if (ctxLen !== null) CONFIG.context_length = ctxLen;
+
+      // Recompute derived values
+      CONFIG.q_dim = CONFIG.num_q_heads * CONFIG.head_dim;
+      CONFIG.kv_dim = CONFIG.num_kv_heads * CONFIG.head_dim;
+
+      const modelSize = CONFIG.num_layers <= 18 ? '270M' : '1B';
+      console.log(`Model detected: Gemma 3 ${modelSize} (hidden=${CONFIG.hidden_size}, layers=${CONFIG.num_layers})`);
+
+      // Update header with detected model
+      const headerTitle = document.getElementById('header-title');
+      if (headerTitle) headerTitle.textContent = `Gemma 3 ${modelSize}`;
+    }
 
     function isSwaLayer(il) {
       return (il % CONFIG.swa_period) < (CONFIG.swa_period - 1);
@@ -2226,6 +2302,97 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
       return escapeHtml(text);
     }
 
+    const CANVAS_TOOLS = new Set(['draw_shape', 'draw_text', 'set_background']);
+
+    function parseFunctionCall(text) {
+      const callMatch = text.match(/call:(\w+)\{(.*)\}/s);
+      if (!callMatch) return null;
+      const funcName = callMatch[1];
+      const paramsRaw = callMatch[2];
+      const paramsClean = paramsRaw.replace(/<escape>/g, '"');
+      try {
+        const params = JSON.parse('{' + paramsClean + '}');
+        return { name: funcName, params };
+      } catch {
+        // Try manual parsing for malformed JSON
+        const params = {};
+        const re = /"(\w+)"\s*:\s*"([^"]*)"/g;
+        let m;
+        while ((m = re.exec(paramsClean)) !== null) {
+          params[m[1]] = m[2];
+        }
+        return { name: funcName, params };
+      }
+    }
+
+    function executeCanvasTool(call) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 300;
+      canvas.height = 200;
+      const ctx = canvas.getContext('2d');
+
+      // Default dark background
+      ctx.fillStyle = '#1a1c24';
+      ctx.fillRect(0, 0, 300, 200);
+
+      const p = call.params;
+
+      if (call.name === 'set_background') {
+        ctx.fillStyle = p.color || '#1a1c24';
+        ctx.fillRect(0, 0, 300, 200);
+      } else if (call.name === 'draw_text') {
+        const fontSize = parseInt(p.fontSize) || 24;
+        const x = parseInt(p.x) || 150;
+        const y = parseInt(p.y) || 100;
+        ctx.fillStyle = p.color || 'white';
+        ctx.font = `${fontSize}px 'DM Sans', sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(p.text || '', x, y);
+      } else if (call.name === 'draw_shape') {
+        const size = parseInt(p.size) || 50;
+        const x = parseInt(p.x) || 150;
+        const y = parseInt(p.y) || 100;
+        ctx.fillStyle = p.color || 'white';
+
+        if (p.shape === 'circle') {
+          ctx.beginPath();
+          ctx.arc(x, y, size / 2, 0, Math.PI * 2);
+          ctx.fill();
+        } else if (p.shape === 'square') {
+          ctx.fillRect(x - size / 2, y - size / 2, size, size);
+        } else if (p.shape === 'triangle') {
+          ctx.beginPath();
+          ctx.moveTo(x, y - size / 2);
+          ctx.lineTo(x - size / 2, y + size / 2);
+          ctx.lineTo(x + size / 2, y + size / 2);
+          ctx.closePath();
+          ctx.fill();
+        } else if (p.shape === 'star') {
+          const outerR = size / 2;
+          const innerR = outerR * 0.4;
+          ctx.beginPath();
+          for (let i = 0; i < 10; i++) {
+            const r = i % 2 === 0 ? outerR : innerR;
+            const angle = (Math.PI / 2) * -1 + (Math.PI / 5) * i;
+            const sx = x + Math.cos(angle) * r;
+            const sy = y + Math.sin(angle) * r;
+            if (i === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+          }
+          ctx.closePath();
+          ctx.fill();
+        } else {
+          // Default to circle for unknown shapes
+          ctx.beginPath();
+          ctx.arc(x, y, size / 2, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
+      return canvas;
+    }
+
     function scrollToBottom() {
       const chat = document.getElementById('chat-area');
       chat.scrollTop = chat.scrollHeight;
@@ -2409,6 +2576,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         textSpan.innerHTML = parsedOutput;
         cursorSpan.remove();
 
+        // Render canvas if it's a drawing tool call
+        const fnCall = parseFunctionCall(rawOutput);
+        if (fnCall && CANVAS_TOOLS.has(fnCall.name)) {
+          const canvas = executeCanvasTool(fnCall);
+          const container = document.createElement('div');
+          container.className = 'canvas-container';
+          container.appendChild(canvas);
+          aiMsg.querySelector('.message-content').appendChild(container);
+        }
+
         metaDiv.innerHTML = `<span class="speed">${finalTokPerSec} t/s</span> &middot; ${genTokenCount} tokens &middot; prefill ${prefillSpeed} t/s (${inputTokens.length} tok)`;
         speedEl.textContent = `${finalTokPerSec} t/s`;
 
@@ -2439,23 +2616,35 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     // =========================================================================
     // Main
     // =========================================================================
+    // Wait for start button click
+    window.startLoading = function() {
+      document.getElementById('start-section').style.display = 'none';
+      document.getElementById('progress-section').style.display = '';
+      main();
+    };
+
+    // Also support ?autostart=1 for direct links
+    if (new URLSearchParams(window.location.search).get('autostart')) {
+      window.startLoading();
+    }
+
     async function main() {
       try {
         setStatus('Initializing WebGPU...');
         await initWebGPU();
 
         setStatus('Downloading model...');
-        // Base Gemma 3 for chat, FunctionGemma for tool calling (use ?model=func to load FunctionGemma)
         const MODELS = {
-          base: 'https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q8_0.gguf',
-          func: 'https://huggingface.co/unsloth/functiongemma-270m-it-GGUF/resolve/main/functiongemma-270m-it-Q8_0.gguf',
+          '1b': 'https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q8_0.gguf',
+          '270m': 'https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q8_0.gguf',
+          'func': 'https://huggingface.co/unsloth/functiongemma-270m-it-GGUF/resolve/main/functiongemma-270m-it-Q8_0.gguf',
         };
         const modelParam = new URLSearchParams(window.location.search).get('model');
-        const modelFile = modelParam === 'func' ? MODELS.func : (modelParam || MODELS.base);
+        const modelFile = MODELS[modelParam] || MODELS['1b'];
 
         const response = await fetch(modelFile);
         const contentLength = response.headers.get('content-length');
-        const total = contentLength ? parseInt(contentLength) : 291543744;
+        const total = contentLength ? parseInt(contentLength) : 1100000000;
         const reader = response.body.getReader();
         const chunks = [];
         let received = 0;
@@ -2479,6 +2668,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         document.getElementById('progress-text').textContent = 'Parsing GGUF...';
         parser = new GGUFParser(buffer);
         gguf = parser.parse();
+
+        // Update CONFIG from GGUF metadata
+        updateConfigFromGGUF(gguf);
 
         setStatus('Extracting tokenizer...');
         document.getElementById('progress-text').textContent = 'Tokenizer...';
@@ -2549,7 +2741,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
       }
     }
 
-    main();
+    // main() is called by startLoading() on button click
   </script>
 </body>
 </html>
