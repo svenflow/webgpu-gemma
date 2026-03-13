@@ -86,10 +86,7 @@
       font-size: 12px; color: var(--text-muted);
       margin-top: 10px; text-align: center;
     }
-    .loading-status {
-      font-size: 12px; color: var(--text-secondary);
-      margin-top: 20px; text-align: center;
-    }
+    /* loading-status removed — status shown in progress-text */
     #start-btn {
       padding: 14px 48px;
       font-family: var(--font-ui);
@@ -402,7 +399,6 @@
         <div class="progress-bar-bg"><div class="progress-bar-fill" id="progress-fill"></div></div>
         <div class="progress-text" id="progress-text">Initializing...</div>
       </div>
-      <div class="loading-status" id="loading-status"></div>
     </div>
   </div>
 
@@ -473,9 +469,9 @@
     };
 
     const setStatus = (msg) => {
-      // During loading, update loading screen
-      const ls = document.getElementById('loading-status');
-      if (ls) ls.textContent = msg;
+      // Show status in the progress text area (below progress bar)
+      const pt = document.getElementById('progress-text');
+      if (pt) pt.textContent = msg;
       console.log('[status]', msg);
     };
 
@@ -2833,18 +2829,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
           updateConfigFromGGUF(gguf);
 
           setStatus('Extracting tokenizer...');
-          document.getElementById('progress-text').textContent = 'Tokenizer...';
           extractTokenizer();
           initFunctionTokens();
 
           const tensors = gguf.tensors;
           const dataOffset = gguf.dataOffset;
-          // Free header buffer — we only need tensor metadata from here
           parser = null;
           gguf = null;
 
           setStatus('Creating pipelines...');
-          document.getElementById('progress-text').textContent = 'GPU pipelines...';
           createPipelines();
           createUniformBuffers();
 
@@ -2868,23 +2861,19 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
           }
 
           setStatus('Parsing model...');
-          document.getElementById('progress-text').textContent = 'Parsing GGUF...';
           parser = new GGUFParser(buffer);
           gguf = parser.parse();
           updateConfigFromGGUF(gguf);
 
           setStatus('Extracting tokenizer...');
-          document.getElementById('progress-text').textContent = 'Tokenizer...';
           extractTokenizer();
           initFunctionTokens();
 
           setStatus('Creating pipelines...');
-          document.getElementById('progress-text').textContent = 'GPU pipelines...';
           createPipelines();
           createUniformBuffers();
 
           setStatus('Uploading weights...');
-          document.getElementById('progress-text').textContent = 'Uploading to GPU...';
           uploadWeightsFromBuffer();
 
           parser = null;
@@ -2893,7 +2882,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         }
 
         setStatus('Creating KV caches...');
-        document.getElementById('progress-text').textContent = 'KV caches...';
         createWorkBuffers();
         createBindGroups();
 
@@ -2940,8 +2928,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
       } catch (err) {
         console.error(err);
-        document.getElementById('loading-status').textContent = `FAILED: ${err.message}`;
-        document.getElementById('progress-text').textContent = 'Error';
+        document.getElementById('progress-text').textContent = `FAILED: ${err.message}`;
         document.getElementById('progress-fill').style.background = 'var(--red)';
       }
     }
