@@ -525,7 +525,9 @@
       if (qHeads !== null) CONFIG.num_q_heads = qHeads;
       if (kvHeads !== null) CONFIG.num_kv_heads = kvHeads;
       if (headDim !== null) CONFIG.head_dim = headDim;
-      if (ctxLen !== null) CONFIG.context_length = ctxLen;
+      // Cap context length to 2048 for manageable KV cache memory
+      // (32K context would need ~1.6GB just for KV caches on 1B model)
+      if (ctxLen !== null) CONFIG.context_length = Math.min(Number(ctxLen), 2048);
 
       // Recompute derived values
       CONFIG.q_dim = CONFIG.num_q_heads * CONFIG.head_dim;
