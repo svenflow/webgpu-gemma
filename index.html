@@ -411,6 +411,7 @@
       </div>
       <div class="header-right">
         <span id="speed-indicator"></span>
+        <button class="settings-btn" id="new-chat-btn" title="New Chat" style="font-size:14px;">&#10227;</button>
         <a href="debug.html">debug</a>
         <button class="settings-btn" id="settings-toggle" title="Settings">&#9881;</button>
       </div>
@@ -1535,42 +1536,51 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
       specialPatternRegex = new RegExp(specialPatternStr, 'g');
     }
 
-    function buildFunctionPrompt(userQuery, toolsJson) {
+    // Build prompt from full conversation history
+    function buildChatPrompt(history, toolsJson) {
+      let systemPrefix = '';
       let tools;
       try {
         tools = JSON.parse(toolsJson);
-        if (!Array.isArray(tools) || tools.length === 0) {
-          return `<start_of_turn>user\n${userQuery}<end_of_turn>\n<start_of_turn>model\n`;
-        }
+        if (!Array.isArray(tools) || tools.length === 0) tools = null;
       } catch (e) {
-        // No valid tools — use plain chat prompt
-        return `<start_of_turn>user\n${userQuery}<end_of_turn>\n<start_of_turn>model\n`;
+        tools = null;
       }
-      let declarations = '';
-      for (const tool of tools) {
-        declarations += `<start_function_declaration>declaration:${tool.name}{`;
-        declarations += `description:<escape>${tool.description}<escape>`;
-        if (tool.parameters) {
-          declarations += `,parameters:{properties:{`;
-          const props = Object.entries(tool.parameters.properties || {});
-          declarations += props.map(([k, v]) => {
-            let param = `${k}:{description:<escape>${v.description}<escape>,type:<escape>${v.type}<escape>`;
-            if (v.enum) {
-              param += `,enum:[${v.enum.map(e => `<escape>${e}<escape>`).join(',')}]`;
+      if (tools) {
+        let declarations = '';
+        for (const tool of tools) {
+          declarations += `<start_function_declaration>declaration:${tool.name}{`;
+          declarations += `description:<escape>${tool.description}<escape>`;
+          if (tool.parameters) {
+            declarations += `,parameters:{properties:{`;
+            const props = Object.entries(tool.parameters.properties || {});
+            declarations += props.map(([k, v]) => {
+              let param = `${k}:{description:<escape>${v.description}<escape>,type:<escape>${v.type}<escape>`;
+              if (v.enum) {
+                param += `,enum:[${v.enum.map(e => `<escape>${e}<escape>`).join(',')}]`;
+              }
+              param += '}';
+              return param;
+            }).join(',');
+            declarations += `}`;
+            if (tool.parameters.required) {
+              declarations += `,required:[${tool.parameters.required.map(r => `<escape>${r}<escape>`).join(',')}]`;
             }
-            param += '}';
-            return param;
-          }).join(',');
-          declarations += `}`;
-          if (tool.parameters.required) {
-            declarations += `,required:[${tool.parameters.required.map(r => `<escape>${r}<escape>`).join(',')}]`;
+            declarations += `,type:<escape>${tool.parameters.type}<escape>`;
+            declarations += `}`;
           }
-          declarations += `,type:<escape>${tool.parameters.type}<escape>`;
-          declarations += `}`;
+          declarations += `}<end_function_declaration>`;
         }
-        declarations += `}<end_function_declaration>`;
+        systemPrefix = `<start_of_turn>developer\nYou are a model that can do function calling with the following functions\n${declarations}\n<end_of_turn>\n`;
       }
-      return `<start_of_turn>developer\nYou are a model that can do function calling with the following functions\n${declarations}\n<end_of_turn>\n<start_of_turn>user\n${userQuery}<end_of_turn>\n<start_of_turn>model\n`;
+
+      // Build full prompt from conversation history
+      let prompt = systemPrefix;
+      for (const turn of history) {
+        prompt += `<start_of_turn>${turn.role}\n${turn.text}<end_of_turn>\n`;
+      }
+      prompt += `<start_of_turn>model\n`;
+      return prompt;
     }
 
     function encodeSegment(text, addPrefix = true) {
@@ -2422,9 +2432,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
       device.queue.submit([encoder.finish()]);
     }
 
-    async function prefillBatched(tokens) {
+    async function prefillBatched(tokens, startPos = 0) {
       for (let i = 0; i < tokens.length; i++) {
-        forwardPassOnly(tokens[i], i);
+        forwardPassOnly(tokens[i], startPos + i);
       }
       await device.queue.onSubmittedWorkDone();
     }
@@ -2444,6 +2454,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     // Chat UI + Generation
     // =========================================================================
     let generating = false;
+    let conversationHistory = []; // [{role: 'user'|'model', text: '...'}]
+    let kvPosition = 0; // Current position in KV cache (tokens already prefilled)
 
     function formatFunctionCallOutput(text) {
       const callMatch = text.match(/call:(\w+)\{(.*)\}/s);
@@ -2595,25 +2607,48 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
       try {
         const toolsJson = document.getElementById('tools-input').value;
-        const chatPrompt = buildFunctionPrompt(prompt, toolsJson);
-        const inputTokens = encodeSimple(chatPrompt);
         const maxTokens = parseInt(document.getElementById('max-tokens').value) || 32768;
         const temperature = parseFloat(document.getElementById('temperature').value) || 0;
         const topP = parseFloat(document.getElementById('top-p').value) || 0.9;
         const repPenalty = parseFloat(document.getElementById('rep-penalty').value) || 1.0;
 
-        resetKVCaches();
+        // Build new tokens to prefill — either full prompt (first msg) or just the new turn suffix
+        let newTokens;
+        conversationHistory.push({ role: 'user', text: prompt });
 
-        // Prefill
+        if (kvPosition === 0) {
+          // First message: encode full prompt including system/tools prefix
+          const fullPrompt = buildChatPrompt(conversationHistory, toolsJson);
+          newTokens = encodeSimple(fullPrompt);
+        } else {
+          // Follow-up: encode only the new turn suffix (avoids re-tokenization issues)
+          // KV cache has everything up to end of last model response
+          // Need: <end_of_turn>\n<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n
+          const suffix = `<end_of_turn>\n<start_of_turn>user\n${prompt}<end_of_turn>\n<start_of_turn>model\n`;
+          newTokens = encodeSimple(suffix).slice(1); // Remove BOS (already in KV cache)
+        }
+
+        // Check if we'd exceed context length — if so, reset and start fresh
+        if (kvPosition + newTokens.length >= CONFIG.context_length - 10) {
+          log('Context full — resetting KV cache and conversation');
+          conversationHistory = [{ role: 'user', text: prompt }];
+          const freshPrompt = buildChatPrompt(conversationHistory, toolsJson);
+          newTokens = encodeSimple(freshPrompt);
+          resetKVCaches();
+          kvPosition = 0;
+        }
+
+        log(`Multi-turn: kvPos=${kvPosition}, prefilling ${newTokens.length} new tokens`);
+
+        // Prefill new tokens
         speedEl.textContent = 'prefilling...';
         speedEl.classList.add('visible');
         const prefillStart = performance.now();
-        await prefillBatched(inputTokens);
+        await prefillBatched(newTokens, kvPosition);
         const prefillTime = performance.now() - prefillStart;
-        const prefillSpeed = (inputTokens.length / prefillTime * 1000).toFixed(0);
-
-        // First token via LM head on prefill state
-        const allTokens = [...inputTokens];
+        var prefillSpeed = (newTokens.length / prefillTime * 1000).toFixed(0);
+        var allTokens = newTokens; // For rep penalty tracking
+        kvPosition += newTokens.length;
         const genStart = performance.now();
         let nextToken;
         {
@@ -2684,6 +2719,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         allTokens.push(nextToken);
         let generatedTokens = [nextToken];
         let genTokenCount = 1;
+        let genKVWrites = 0; // Track actual forward passes (KV cache writes)
 
         textSpan.textContent = decodeToken(nextToken);
 
@@ -2696,10 +2732,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             break;
           }
 
-          const pos = inputTokens.length + step - 1;
+          const pos = kvPosition + genKVWrites;
           if (pos >= CONFIG.context_length - 1) break;
 
           nextToken = await forwardPassAndGetToken(nextToken, pos, temperature, topP, repPenalty, allTokens);
+          genKVWrites++;
 
           if (nextToken === 1 || nextToken === 0 || nextToken === 106) break;
           if (FUNC_TOKENS['<end_function_call>'] && nextToken === FUNC_TOKENS['<end_function_call>']) {
@@ -2724,8 +2761,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         const totalGenTime = performance.now() - genStart;
         const finalTokPerSec = (genTokenCount / totalGenTime * 1000).toFixed(1);
 
-        // Final display: parse function calls
+        // Save model response and update KV position
         const rawOutput = decodeTokens(generatedTokens);
+        conversationHistory.push({ role: 'model', text: rawOutput });
+        // KV position advances by actual forward passes (each writes one KV entry)
+        kvPosition += genKVWrites;
+        log(`Generation done: ${genTokenCount} tokens, kvPosition now ${kvPosition}`);
+
+        // Final display: parse function calls
         const parsedOutput = formatFunctionCallOutput(rawOutput);
         textSpan.innerHTML = parsedOutput;
         cursorSpan.remove();
@@ -2740,7 +2783,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
           aiMsg.querySelector('.message-content').appendChild(container);
         }
 
-        metaDiv.innerHTML = `<span class="speed">${finalTokPerSec} t/s</span> &middot; ${genTokenCount} tokens &middot; prefill ${prefillSpeed} t/s (${inputTokens.length} tok)`;
+        metaDiv.innerHTML = `<span class="speed">${finalTokPerSec} t/s</span> &middot; ${genTokenCount} tokens &middot; prefill ${prefillSpeed} t/s (${newTokens.length} new tok)`;
         speedEl.textContent = `${finalTokPerSec} t/s`;
 
         scrollToBottom();
@@ -2890,6 +2933,17 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         document.getElementById('app').classList.add('visible');
         document.getElementById('send-btn').disabled = false;
         document.getElementById('prompt-input').focus();
+
+        // New Chat button — resets conversation history and KV cache
+        document.getElementById('new-chat-btn').addEventListener('click', () => {
+          if (generating) return;
+          conversationHistory = [];
+          kvPosition = 0;
+          resetKVCaches();
+          document.getElementById('chat-area').innerHTML = '';
+          document.getElementById('prompt-input').focus();
+          log('New chat started');
+        });
 
         // Settings toggle
         document.getElementById('settings-toggle').addEventListener('click', () => {
