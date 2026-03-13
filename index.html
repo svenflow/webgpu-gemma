@@ -389,7 +389,7 @@
     <div class="loading-subtitle">WebGPU Inference Engine</div>
     <div id="start-section">
       <button id="start-btn" onclick="startLoading()">Start</button>
-      <div class="start-subtext">Downloads ~1 GB of model weights to run locally in your browser.<br>No data leaves your device.</div>
+      <div class="start-subtext" id="start-subtext">Downloads model weights to run locally in your browser.<br>No data leaves your device.</div>
     </div>
     <div id="progress-section" style="display:none;">
       <div class="progress-container">
@@ -2616,6 +2616,17 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     // =========================================================================
     // Main
     // =========================================================================
+    // Detect model size for UI
+    const _isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    const _modelParam = new URLSearchParams(window.location.search).get('model');
+    const _willLoad = _modelParam || (_isMobile ? '270m' : '1b');
+    const _sizeText = (_willLoad === '1b') ? '~1 GB' : '~300 MB';
+    document.getElementById('start-subtext').innerHTML =
+      `Downloads ${_sizeText} of model weights to run locally in your browser.<br>No data leaves your device.`;
+    if (_willLoad !== '1b') {
+      document.querySelector('.loading-title').textContent = 'Gemma 3 270M';
+    }
+
     // Wait for start button click
     window.startLoading = function() {
       document.getElementById('start-section').style.display = 'none';
@@ -2640,7 +2651,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
           'func': 'https://huggingface.co/unsloth/functiongemma-270m-it-GGUF/resolve/main/functiongemma-270m-it-Q8_0.gguf',
         };
         const modelParam = new URLSearchParams(window.location.search).get('model');
-        const modelFile = MODELS[modelParam] || MODELS['1b'];
+        // Auto-detect mobile → use smaller 270M model to avoid OOM
+        const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+        const defaultModel = isMobile ? '270m' : '1b';
+        const modelFile = MODELS[modelParam] || MODELS[defaultModel];
+        log(`Device: ${isMobile ? 'mobile' : 'desktop'}, model: ${modelParam || defaultModel}`);
 
         const response = await fetch(modelFile);
         const contentLength = response.headers.get('content-length');
