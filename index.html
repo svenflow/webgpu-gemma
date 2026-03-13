@@ -387,7 +387,13 @@
   <div id="loading-screen">
     <div class="loading-title">Gemma 3</div>
     <div class="loading-subtitle">WebGPU Inference Engine</div>
-    <div id="start-section">
+    <div id="start-section" style="text-align:center;">
+      <div style="margin-bottom:12px;">
+        <select id="model-select" style="background:#2a2a2a;color:#e0e0e0;border:1px solid #444;border-radius:6px;padding:6px 12px;font-size:14px;font-family:var(--font-ui);cursor:pointer;">
+          <option value="1b">Gemma 3 1B (1 GB) — Best quality</option>
+          <option value="270m">Gemma 3 270M (300 MB) — Faster</option>
+        </select>
+      </div>
       <button id="start-btn" onclick="startLoading()">Start</button>
       <div class="start-subtext" id="start-subtext">Downloads model weights to run locally in your browser.<br>No data leaves your device.</div>
     </div>
@@ -817,7 +823,7 @@ struct Params { M: u32, N: u32 }
 @group(0) @binding(1) var<storage, read> weight_q8: array<u32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
-var<workgroup> shared_input: array<f32, 2048>;
+var<workgroup> shared_tile: array<f32, 2048>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>,
@@ -825,38 +831,51 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
   let m = gid.x;
   let tid = lid.x;
   let N = params.N;
-  var i = tid;
-  while (i < N) {
-    shared_input[i] = input[i];
-    i += 256u;
-  }
-  workgroupBarrier();
-  if (m >= params.M) { return; }
   let blocks_per_row = N / 32u;
   let row_offset = m * blocks_per_row * 9u;
   var total_sum: f32 = 0.0;
-  for (var b: u32 = 0u; b < blocks_per_row; b++) {
-    let block_off = row_offset + b * 9u;
-    let scale = bitcast<f32>(weight_q8[block_off]);
-    let input_base = b * 32u;
-    var block_sum: f32 = 0.0;
-    for (var chunk: u32 = 0u; chunk < 4u; chunk++) {
-      let chunk_base = input_base + chunk * 8u;
-      let qs_base = block_off + 1u + chunk * 2u;
-      let packed0 = weight_q8[qs_base];
-      let packed1 = weight_q8[qs_base + 1u];
-      block_sum += f32(extractBits(bitcast<i32>(packed0), 0u, 8u))  * shared_input[chunk_base + 0u];
-      block_sum += f32(extractBits(bitcast<i32>(packed0), 8u, 8u))  * shared_input[chunk_base + 1u];
-      block_sum += f32(extractBits(bitcast<i32>(packed0), 16u, 8u)) * shared_input[chunk_base + 2u];
-      block_sum += f32(extractBits(bitcast<i32>(packed0), 24u, 8u)) * shared_input[chunk_base + 3u];
-      block_sum += f32(extractBits(bitcast<i32>(packed1), 0u, 8u))  * shared_input[chunk_base + 4u];
-      block_sum += f32(extractBits(bitcast<i32>(packed1), 8u, 8u))  * shared_input[chunk_base + 5u];
-      block_sum += f32(extractBits(bitcast<i32>(packed1), 16u, 8u)) * shared_input[chunk_base + 6u];
-      block_sum += f32(extractBits(bitcast<i32>(packed1), 24u, 8u)) * shared_input[chunk_base + 7u];
+  let TILE: u32 = 2048u;
+
+  var tile_start: u32 = 0u;
+  while (tile_start < N) {
+    let tile_size = min(TILE, N - tile_start);
+    var i = tid;
+    while (i < tile_size) {
+      shared_tile[i] = input[tile_start + i];
+      i += 256u;
     }
-    total_sum += block_sum * scale;
+    workgroupBarrier();
+    if (m < params.M) {
+      let block_start = tile_start / 32u;
+      let block_end = (tile_start + tile_size) / 32u;
+      for (var b = block_start; b < block_end; b++) {
+        let block_off = row_offset + b * 9u;
+        let scale = bitcast<f32>(weight_q8[block_off]);
+        let local_base = b * 32u - tile_start;
+        var block_sum: f32 = 0.0;
+        for (var chunk: u32 = 0u; chunk < 4u; chunk++) {
+          let c = local_base + chunk * 8u;
+          let qs_base = block_off + 1u + chunk * 2u;
+          let packed0 = weight_q8[qs_base];
+          let packed1 = weight_q8[qs_base + 1u];
+          block_sum += f32(extractBits(bitcast<i32>(packed0), 0u, 8u))  * shared_tile[c + 0u];
+          block_sum += f32(extractBits(bitcast<i32>(packed0), 8u, 8u))  * shared_tile[c + 1u];
+          block_sum += f32(extractBits(bitcast<i32>(packed0), 16u, 8u)) * shared_tile[c + 2u];
+          block_sum += f32(extractBits(bitcast<i32>(packed0), 24u, 8u)) * shared_tile[c + 3u];
+          block_sum += f32(extractBits(bitcast<i32>(packed1), 0u, 8u))  * shared_tile[c + 4u];
+          block_sum += f32(extractBits(bitcast<i32>(packed1), 8u, 8u))  * shared_tile[c + 5u];
+          block_sum += f32(extractBits(bitcast<i32>(packed1), 16u, 8u)) * shared_tile[c + 6u];
+          block_sum += f32(extractBits(bitcast<i32>(packed1), 24u, 8u)) * shared_tile[c + 7u];
+        }
+        total_sum += block_sum * scale;
+      }
+    }
+    workgroupBarrier();
+    tile_start += TILE;
   }
-  output[m] = total_sum;
+  if (m < params.M) {
+    output[m] = total_sum;
+  }
 }`,
 
       linearF32: `
@@ -2621,13 +2640,19 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     // Detect model size for UI
     const _isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
     const _modelParam = new URLSearchParams(window.location.search).get('model');
-    const _willLoad = _modelParam || (_isMobile ? '270m' : '1b');
-    const _sizeText = (_willLoad === '1b') ? '~1 GB' : '~300 MB';
-    document.getElementById('start-subtext').innerHTML =
-      `Downloads ${_sizeText} of model weights to run locally in your browser.<br>No data leaves your device.`;
-    if (_willLoad !== '1b') {
-      document.querySelector('.loading-title').textContent = 'Gemma 3 270M';
+    const _defaultModel = _modelParam || (_isMobile ? '270m' : '1b');
+    const _modelSelect = document.getElementById('model-select');
+    _modelSelect.value = _defaultModel;
+    function _updateStartUI() {
+      const sel = _modelSelect.value;
+      const sizeText = (sel === '1b') ? '~1 GB' : '~300 MB';
+      document.getElementById('start-subtext').innerHTML =
+        `Downloads ${sizeText} of model weights to run locally in your browser.<br>No data leaves your device.`;
+      document.querySelector('.loading-title').textContent =
+        sel === '1b' ? 'Gemma 3' : 'Gemma 3 270M';
     }
+    _modelSelect.addEventListener('change', _updateStartUI);
+    _updateStartUI();
 
     // Wait for start button click
     window.startLoading = function() {
@@ -2652,12 +2677,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
           '270m': 'https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q8_0.gguf',
           'func': 'https://huggingface.co/unsloth/functiongemma-270m-it-GGUF/resolve/main/functiongemma-270m-it-Q8_0.gguf',
         };
-        const modelParam = new URLSearchParams(window.location.search).get('model');
-        // Auto-detect mobile → use smaller 270M model to avoid OOM
-        const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-        const defaultModel = isMobile ? '270m' : '1b';
-        const modelFile = MODELS[modelParam] || MODELS[defaultModel];
-        log(`Device: ${isMobile ? 'mobile' : 'desktop'}, model: ${modelParam || defaultModel}`);
+        const selectedModel = document.getElementById('model-select').value;
+        const modelFile = MODELS[selectedModel] || MODELS['1b'];
+        log(`Selected model: ${selectedModel}`);
 
         const response = await fetch(modelFile);
         const contentLength = response.headers.get('content-length');
