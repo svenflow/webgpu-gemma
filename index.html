@@ -531,9 +531,11 @@
       if (qHeads !== null) CONFIG.num_q_heads = qHeads;
       if (kvHeads !== null) CONFIG.num_kv_heads = kvHeads;
       if (headDim !== null) CONFIG.head_dim = headDim;
-      // Cap context length to 2048 for manageable KV cache memory
-      // (32K context would need ~1.6GB just for KV caches on 1B model)
-      if (ctxLen !== null) CONFIG.context_length = Math.min(Number(ctxLen), 2048);
+      // Cap context length for manageable KV cache memory
+      // Desktop: 2048 tokens, Mobile: 512 tokens (saves ~300MB GPU memory for 1B model)
+      const isMobileDevice = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+      const maxCtx = isMobileDevice ? 512 : 2048;
+      if (ctxLen !== null) CONFIG.context_length = Math.min(Number(ctxLen), maxCtx);
 
       // Recompute derived values
       CONFIG.q_dim = CONFIG.num_q_heads * CONFIG.head_dim;
@@ -2685,22 +2687,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         const contentLength = response.headers.get('content-length');
         const total = contentLength ? parseInt(contentLength) : 1100000000;
         const reader = response.body.getReader();
-        const chunks = [];
+        // Pre-allocate single buffer — avoids 2x peak memory from chunks[] + concat
+        const buffer = new Uint8Array(total);
         let received = 0;
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          chunks.push(value);
+          buffer.set(value, received);
           received += value.length;
           setProgress(received, total);
-        }
-
-        const buffer = new Uint8Array(received);
-        let offset = 0;
-        for (const chunk of chunks) {
-          buffer.set(chunk, offset);
-          offset += chunk.length;
         }
 
         setStatus('Parsing model...');
@@ -2725,9 +2721,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         document.getElementById('progress-text').textContent = 'Uploading to GPU...';
         uploadWeightsToGPU();
 
+        // Free JS memory BEFORE allocating KV caches — critical for iPhone
+        // This releases the ~1GB download buffer so GPU has room for KV caches
         parser = null;
         gguf = null;
+        // Wait for GPU uploads to flush before freeing the underlying buffer
+        await device.queue.onSubmittedWorkDone();
 
+        setStatus('Creating KV caches...');
+        document.getElementById('progress-text').textContent = 'KV caches...';
         createWorkBuffers();
         createBindGroups();
 
