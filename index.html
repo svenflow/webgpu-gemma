@@ -1646,7 +1646,17 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     // =========================================================================
     // Upload weights
     // =========================================================================
-    function uploadWeightsToGPU() {
+    // Compute byte size of a tensor in GGUF file
+    function tensorByteSize(tensor) {
+      const numElements = Number(tensor.dims.reduce((a, b) => a * b, 1n));
+      if (tensor.type === 8) return (numElements / 32) * 34; // Q8_0: 34 bytes per block of 32
+      if (tensor.type === 0) return numElements * 4; // F32
+      if (tensor.type === 1) return numElements * 2; // F16
+      throw new Error(`Unknown tensor type: ${tensor.type}`);
+    }
+
+    // Upload weights from a full buffer (desktop path)
+    function uploadWeightsFromBuffer() {
       const tensors = gguf.tensors;
       const dataOffset = gguf.dataOffset;
 
@@ -1658,8 +1668,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
       const embedTensor = tensors.find(t => t.name === 'token_embd.weight');
       if (embedTensor) {
-        const H = CONFIG.hidden_size;
-        const V = CONFIG.vocab_size;
         if (embedTensor.type === 8) {
           const packedEmbedding = parser.getTensorDataQ8Packed(embedTensor, dataOffset);
           modelBuffers.embeddingQ8 = device.createBuffer({
@@ -1724,6 +1732,133 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         modelBuffers.layers.push(layer);
       }
       log(`Loaded ${CONFIG.num_layers} transformer layers`);
+    }
+
+    // Upload weights via Range requests — keeps peak JS memory at ~50MB instead of ~1GB
+    async function uploadWeightsStreaming(modelFile, tensors, dataOffset) {
+      modelBuffers = {
+        embeddingQ8: null,
+        layers: [],
+        finalNorm: null,
+      };
+
+      const q8WeightNames = ['attn_q', 'attn_k', 'attn_v', 'attn_output', 'ffn_gate', 'ffn_up', 'ffn_down'];
+      const f32WeightNames = ['attn_norm', 'ffn_norm', 'attn_q_norm', 'attn_k_norm', 'post_attention_norm', 'post_ffw_norm'];
+
+      // Helper: fetch a byte range from the model file
+      async function fetchRange(start, size) {
+        const resp = await fetch(modelFile, { headers: { Range: `bytes=${start}-${start + size - 1}` } });
+        return new Uint8Array(await resp.arrayBuffer());
+      }
+
+      // Helper: upload a single tensor from fetched bytes
+      function uploadTensor(bytes, localOffset, tensor) {
+        const tempParser = new GGUFParser(bytes);
+        const numElements = Number(tensor.dims.reduce((a, b) => a * b, 1n));
+        if (tensor.type === 8) {
+          const data = tempParser.packQ8_0ForGPU(localOffset, numElements);
+          const buf = device.createBuffer({
+            size: data.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+          });
+          device.queue.writeBuffer(buf, 0, data);
+          return { buf, packed: true, byteLength: data.byteLength, numElements };
+        } else {
+          // For F32/F16, copy to avoid alignment issues with typed array views
+          const count = numElements;
+          let data;
+          if (tensor.type === 0) {
+            data = new Float32Array(count);
+            const src = new Uint8Array(bytes.buffer, bytes.byteOffset + localOffset, count * 4);
+            new Uint8Array(data.buffer).set(src);
+          } else {
+            data = tempParser.dequantizeF16(localOffset, count);
+          }
+          const buf = device.createBuffer({
+            size: data.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+          });
+          device.queue.writeBuffer(buf, 0, data);
+          return { buf, packed: false, byteLength: data.byteLength, numElements };
+        }
+      }
+
+      let totalUploaded = 0;
+      const totalWeightBytes = tensors.reduce((sum, t) => sum + tensorByteSize(t), 0);
+
+      // Upload embedding
+      const embedTensor = tensors.find(t => t.name === 'token_embd.weight');
+      if (embedTensor) {
+        const fileOffset = dataOffset + Number(embedTensor.offset);
+        const size = tensorByteSize(embedTensor);
+        const bytes = await fetchRange(fileOffset, size);
+        const result = uploadTensor(bytes, 0, embedTensor);
+        modelBuffers.embeddingQ8 = result.buf;
+        totalUploaded += size;
+        setProgress(totalUploaded, totalWeightBytes);
+        log(`Loaded Q8_0 packed embedding: ${(result.byteLength / 1e6).toFixed(1)}MB`);
+      }
+
+      // Upload final norm
+      const finalNormTensor = tensors.find(t => t.name === 'output_norm.weight');
+      if (finalNormTensor) {
+        const fileOffset = dataOffset + Number(finalNormTensor.offset);
+        const size = tensorByteSize(finalNormTensor);
+        const bytes = await fetchRange(fileOffset, size);
+        const result = uploadTensor(bytes, 0, finalNormTensor);
+        modelBuffers.finalNorm = result.buf;
+        totalUploaded += size;
+      }
+
+      // Upload layers one at a time via Range requests
+      for (let i = 0; i < CONFIG.num_layers; i++) {
+        const prefix = `blk.${i}.`;
+        const layerTensors = tensors.filter(t => t.name.startsWith(prefix));
+        if (layerTensors.length === 0) continue;
+
+        // Compute byte range for entire layer (tensors are contiguous in GGUF)
+        let minOffset = Infinity, maxEnd = 0;
+        for (const t of layerTensors) {
+          const off = Number(t.offset);
+          const end = off + tensorByteSize(t);
+          if (off < minOffset) minOffset = off;
+          if (end > maxEnd) maxEnd = end;
+        }
+
+        // Fetch entire layer in one Range request (~44MB for 1B model)
+        const layerStart = dataOffset + minOffset;
+        const layerSize = maxEnd - minOffset;
+        const layerBytes = await fetchRange(layerStart, layerSize);
+
+        const layer = {};
+        for (const key of f32WeightNames) {
+          const tensor = layerTensors.find(t => t.name === prefix + key + '.weight');
+          if (tensor) {
+            const localOffset = Number(tensor.offset) - minOffset;
+            const result = uploadTensor(layerBytes, localOffset, tensor);
+            layer[key] = result.buf;
+          }
+        }
+        for (const key of q8WeightNames) {
+          const tensor = layerTensors.find(t => t.name === prefix + key + '.weight');
+          if (tensor) {
+            const localOffset = Number(tensor.offset) - minOffset;
+            const result = uploadTensor(layerBytes, localOffset, tensor);
+            layer[key] = result.buf;
+            if (i === 0) {
+              weightMemoryQ8 += result.byteLength;
+              weightMemoryF32Equiv += result.numElements * 4;
+            }
+          }
+        }
+        modelBuffers.layers.push(layer);
+        totalUploaded += layerSize;
+        setProgress(totalUploaded, totalWeightBytes);
+        document.getElementById('progress-text').textContent =
+          `Layer ${i + 1}/${CONFIG.num_layers} · ${(totalUploaded / 1e6).toFixed(0)} MB`;
+        // layerBytes goes out of scope → GC can reclaim ~44MB
+      }
+      log(`Streamed ${CONFIG.num_layers} transformer layers to GPU`);
     }
 
     // =========================================================================
@@ -2673,7 +2808,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         setStatus('Initializing WebGPU...');
         await initWebGPU();
 
-        setStatus('Downloading model...');
         const MODELS = {
           '1b': 'https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q8_0.gguf',
           '270m': 'https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q8_0.gguf',
@@ -2683,50 +2817,80 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         const modelFile = MODELS[selectedModel] || MODELS['1b'];
         log(`Selected model: ${selectedModel}`);
 
-        const response = await fetch(modelFile);
-        const contentLength = response.headers.get('content-length');
-        const total = contentLength ? parseInt(contentLength) : 1100000000;
-        const reader = response.body.getReader();
-        // Pre-allocate single buffer — avoids 2x peak memory from chunks[] + concat
-        const buffer = new Uint8Array(total);
-        let received = 0;
+        // Try Range request for header — if supported, use streaming upload (low memory)
+        setStatus('Downloading header...');
+        const HEADER_FETCH_SIZE = 20 * 1024 * 1024; // 20MB covers metadata + tokenizer
+        const headerResp = await fetch(modelFile, { headers: { Range: `bytes=0-${HEADER_FETCH_SIZE - 1}` } });
+        const supportsRange = headerResp.status === 206;
+        log(`Range requests: ${supportsRange ? 'supported' : 'not supported, using full download'}`);
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer.set(value, received);
-          received += value.length;
-          setProgress(received, total);
+        if (supportsRange) {
+          // === STREAMING PATH: Low memory — fetches weights per-layer via Range requests ===
+          // Peak JS memory: ~50MB (one layer at a time) instead of ~1GB (full model)
+          const headerBuf = new Uint8Array(await headerResp.arrayBuffer());
+          parser = new GGUFParser(headerBuf);
+          gguf = parser.parse();
+          updateConfigFromGGUF(gguf);
+
+          setStatus('Extracting tokenizer...');
+          document.getElementById('progress-text').textContent = 'Tokenizer...';
+          extractTokenizer();
+          initFunctionTokens();
+
+          const tensors = gguf.tensors;
+          const dataOffset = gguf.dataOffset;
+          // Free header buffer — we only need tensor metadata from here
+          parser = null;
+          gguf = null;
+
+          setStatus('Creating pipelines...');
+          document.getElementById('progress-text').textContent = 'GPU pipelines...';
+          createPipelines();
+          createUniformBuffers();
+
+          setStatus('Streaming weights to GPU...');
+          await uploadWeightsStreaming(modelFile, tensors, dataOffset);
+        } else {
+          // === FULL DOWNLOAD PATH: Desktop fallback ===
+          setStatus('Downloading model...');
+          // headerResp has the full file (server ignored Range header)
+          const contentLength = headerResp.headers.get('content-length');
+          const total = contentLength ? parseInt(contentLength) : 1100000000;
+          const reader = headerResp.body.getReader();
+          const buffer = new Uint8Array(total);
+          let received = 0;
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer.set(value, received);
+            received += value.length;
+            setProgress(received, total);
+          }
+
+          setStatus('Parsing model...');
+          document.getElementById('progress-text').textContent = 'Parsing GGUF...';
+          parser = new GGUFParser(buffer);
+          gguf = parser.parse();
+          updateConfigFromGGUF(gguf);
+
+          setStatus('Extracting tokenizer...');
+          document.getElementById('progress-text').textContent = 'Tokenizer...';
+          extractTokenizer();
+          initFunctionTokens();
+
+          setStatus('Creating pipelines...');
+          document.getElementById('progress-text').textContent = 'GPU pipelines...';
+          createPipelines();
+          createUniformBuffers();
+
+          setStatus('Uploading weights...');
+          document.getElementById('progress-text').textContent = 'Uploading to GPU...';
+          uploadWeightsFromBuffer();
+
+          parser = null;
+          gguf = null;
+          await device.queue.onSubmittedWorkDone();
         }
-
-        setStatus('Parsing model...');
-        document.getElementById('progress-text').textContent = 'Parsing GGUF...';
-        parser = new GGUFParser(buffer);
-        gguf = parser.parse();
-
-        // Update CONFIG from GGUF metadata
-        updateConfigFromGGUF(gguf);
-
-        setStatus('Extracting tokenizer...');
-        document.getElementById('progress-text').textContent = 'Tokenizer...';
-        extractTokenizer();
-        initFunctionTokens();
-
-        setStatus('Creating pipelines...');
-        document.getElementById('progress-text').textContent = 'GPU pipelines...';
-        createPipelines();
-        createUniformBuffers();
-
-        setStatus('Uploading weights...');
-        document.getElementById('progress-text').textContent = 'Uploading to GPU...';
-        uploadWeightsToGPU();
-
-        // Free JS memory BEFORE allocating KV caches — critical for iPhone
-        // This releases the ~1GB download buffer so GPU has room for KV caches
-        parser = null;
-        gguf = null;
-        // Wait for GPU uploads to flush before freeing the underlying buffer
-        await device.queue.onSubmittedWorkDone();
 
         setStatus('Creating KV caches...');
         document.getElementById('progress-text').textContent = 'KV caches...';
